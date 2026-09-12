@@ -1,15 +1,33 @@
 """
-Image and Video Forensic Detection Engine.
+Advanced Deepfake Detection Engine.
 
-Analyzes:
-- Images
-- Videos
-- Metadata
-- Basic manipulation indicators
-- Face-related indicators
+Pipeline:
 
-This is an explainable forensic foundation.
-A trained computer-vision/deepfake model can be integrated later.
+Image/Video
+    ↓
+Face Detection
+    ↓
+Face Crop
+    ↓
+EfficientNet
+    ↓
+Xception
+    ↓
+Vision Transformer
+    ↓
+Ensemble Fusion
+    ↓
+Deepfake Probability
+    ↓
+Risk Classification
+
+Video additionally:
+    ↓
+Frame Sampling
+    ↓
+Frame-level AI inference
+    ↓
+Temporal consistency analysis
 """
 
 from __future__ import annotations
@@ -17,10 +35,15 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from ai_engine.deepfake_models import (
+    get_model_ensemble,
+)
 
-# ---------------------------------------------------------
-# Constants
-# ---------------------------------------------------------
+from ai_engine.media_pipeline import (
+    prepare_image,
+    prepare_video,
+)
+
 
 MAX_FILE_SIZE = 20 * 1024 * 1024
 
@@ -40,536 +63,531 @@ VIDEO_EXTENSIONS = {
 }
 
 
-# ---------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------
+def _clamp(
+    value: float,
+) -> float:
 
-def _clamp_score(score: float) -> float:
-    return round(max(0.0, min(100.0, float(score))), 2)
+    return round(
+        max(
+            0.0,
+            min(
+                100.0,
+                float(value),
+            ),
+        ),
+        2,
+    )
 
 
-def _get_severity(score: float) -> str:
+def _severity(
+    score: float,
+) -> str:
+
     if score >= 80:
         return "CRITICAL"
+
     if score >= 60:
         return "HIGH"
+
     if score >= 40:
         return "MEDIUM"
+
     if score >= 20:
         return "LOW"
+
     return "SAFE"
 
 
-def _validate_file(
-    file_name: str,
-    file_size: int,
-    media_type: str,
-) -> tuple[bool, str]:
+def _prediction(
+    score: float,
+) -> str:
 
-    if not file_name:
-        return False, "File name is required."
+    if score >= 80:
+        return (
+            "LIKELY_DEEPFAKE_OR_MANIPULATED"
+        )
 
-    if file_size <= 0:
-        return False, "File is empty."
+    if score >= 60:
+        return (
+            "HIGH_MANIPULATION_RISK"
+        )
 
-    if file_size > MAX_FILE_SIZE:
-        return False, "File size exceeds the 20 MB limit."
+    if score >= 40:
+        return "SUSPICIOUS_MEDIA"
 
-    extension = Path(file_name).suffix.lower()
+    if score >= 20:
+        return "LOW_MANIPULATION_RISK"
 
-    if media_type == "image":
-        if extension not in IMAGE_EXTENSIONS:
-            return False, "Unsupported image format."
-
-    elif media_type == "video":
-        if extension not in VIDEO_EXTENSIONS:
-            return False, "Unsupported video format."
-
-    else:
-        return False, "Unsupported media type."
-
-    return True, ""
+    return (
+        "NO_MAJOR_MANIPULATION_INDICATOR"
+    )
 
 
-# ---------------------------------------------------------
-# Image analysis
-# ---------------------------------------------------------
+def _confidence(
+    score: float,
+) -> float:
+
+    if score >= 80:
+        return 0.90
+
+    if score >= 60:
+        return 0.82
+
+    if score >= 40:
+        return 0.72
+
+    if score >= 20:
+        return 0.62
+
+    return 0.55
+
+
+def _model_score(
+    result: dict[str, Any],
+) -> float:
+
+    scores = result[
+        "ensemble_scores"
+    ]
+
+    if not scores:
+        return 0.0
+
+    return sum(scores) / len(scores)
+
+
+def _temporal_score(
+    frame_scores: list[float],
+) -> float:
+
+    if len(frame_scores) < 2:
+        return 0.0
+
+    average = sum(
+        frame_scores
+    ) / len(frame_scores)
+
+    variance = sum(
+        (
+            score - average
+        ) ** 2
+        for score in frame_scores
+    ) / len(frame_scores)
+
+    # Large frame-to-frame changes
+    # can be a temporal warning signal.
+    volatility = min(
+        30.0,
+        variance ** 0.5,
+    )
+
+    return round(
+        volatility,
+        2,
+    )
+
+
+def _recommendation(
+    severity: str,
+) -> str:
+
+    if severity == "CRITICAL":
+
+        return (
+            "Quarantine the media, flag the incident "
+            "and perform identity verification."
+        )
+
+    if severity == "HIGH":
+
+        return (
+            "Treat the media as highly suspicious and "
+            "perform additional forensic verification."
+        )
+
+    if severity == "MEDIUM":
+
+        return (
+            "Review the AI model evidence before trusting "
+            "the media."
+        )
+
+    if severity == "LOW":
+
+        return (
+            "Continue monitoring; manipulation probability "
+            "is currently low."
+        )
+
+    return (
+        "No major manipulation indicator was detected."
+    )
+
 
 def analyze_image(
     file_name: str,
     file_size: int,
-    *,
-    face_detected: bool = False,
-    multiple_faces: bool = False,
-    face_manipulation_indicator: bool = False,
-    lighting_inconsistency: bool = False,
-    edge_artifact_indicator: bool = False,
-    compression_anomaly: bool = False,
-    metadata_missing: bool = False,
-    identity_match_indicator: bool = False,
-    face_swap_indicator: bool = False,
-    suspicious_face_region: bool = False,
-    visual_mismatch_indicator: bool = False,
 ) -> dict[str, Any]:
 
-    is_valid, error = _validate_file(
-        file_name,
-        file_size,
-        "image",
-    )
+    extension = Path(
+        file_name
+    ).suffix.lower()
 
-    if not is_valid:
+    if not file_name:
+
         return {
-            "analysis_type": "image_forensics",
             "is_valid": False,
+            "prediction": "INVALID_INPUT",
             "risk_score": 0.0,
             "severity": "SAFE",
-            "prediction": "INVALID_INPUT",
-            "confidence": 0.0,
-            "indicators": [],
-            "features": {},
-            "recommendation": error,
+            "error": "File name is required.",
         }
 
-    score = 0.0
-    indicators: list[str] = []
+    if file_size <= 0:
 
-    # -----------------------------------------------------
-    # Face analysis
-    # -----------------------------------------------------
+        return {
+            "is_valid": False,
+            "prediction": "INVALID_INPUT",
+            "risk_score": 0.0,
+            "severity": "SAFE",
+            "error": "File is empty.",
+        }
 
-    if face_detected:
-        indicators.append("Face detected in the image.")
+    if file_size > MAX_FILE_SIZE:
 
-    if multiple_faces:
-        score += 5
-        indicators.append(
-            "Multiple faces detected in the image."
-        )
+        return {
+            "is_valid": False,
+            "prediction": "INVALID_INPUT",
+            "risk_score": 0.0,
+            "severity": "SAFE",
+            "error": "File size exceeds 20 MB.",
+        }
 
-    # -----------------------------------------------------
-    # Manipulation indicators
-    # -----------------------------------------------------
+    if extension not in IMAGE_EXTENSIONS:
 
-    if face_manipulation_indicator:
-        score += 30
-        indicators.append(
-            "Possible facial manipulation detected."
-        )
+        return {
+            "is_valid": False,
+            "prediction": "INVALID_INPUT",
+            "risk_score": 0.0,
+            "severity": "SAFE",
+            "error": "Unsupported image format.",
+        }
 
-    if face_swap_indicator:
-        score += 30
-        indicators.append(
-            "Possible face-swap indicator detected."
-        )
-
-    if suspicious_face_region:
-        score += 20
-        indicators.append(
-            "Suspicious alteration detected around a facial region."
-        )
-
-    if visual_mismatch_indicator:
-        score += 20
-        indicators.append(
-            "Visual identity mismatch indicator detected."
-        )
-
-    # -----------------------------------------------------
-    # Image forensic indicators
-    # -----------------------------------------------------
-
-    if lighting_inconsistency:
-        score += 15
-        indicators.append(
-            "Lighting or shadow inconsistency detected."
-        )
-
-    if edge_artifact_indicator:
-        score += 20
-        indicators.append(
-            "Possible edge or blending artifact detected."
-        )
-
-    if compression_anomaly:
-        score += 15
-        indicators.append(
-            "Unusual compression pattern detected."
-        )
-
-    if metadata_missing:
-        score += 3
-        indicators.append(
-            "Image metadata is missing or unavailable."
-        )
-
-    # -----------------------------------------------------
-    # Correlation rules
-    # -----------------------------------------------------
-
-    if face_manipulation_indicator and edge_artifact_indicator:
-        score += 15
-        indicators.append(
-            "Facial manipulation combined with blending artifacts."
-        )
-
-    if face_swap_indicator and visual_mismatch_indicator:
-        score += 15
-        indicators.append(
-            "Face-swap and visual identity mismatch detected together."
-        )
-
-    if lighting_inconsistency and edge_artifact_indicator:
-        score += 10
-        indicators.append(
-            "Lighting inconsistency combined with edge artifacts."
-        )
-
-    if (
-        face_manipulation_indicator
-        and compression_anomaly
-        and lighting_inconsistency
-    ):
-        score += 15
-        indicators.append(
-            "Multiple independent forensic indicators detected."
-        )
-
-    score = _clamp_score(score)
-    severity = _get_severity(score)
-
-    # -----------------------------------------------------
-    # Prediction
-    # -----------------------------------------------------
-
-    if score >= 80:
-        prediction = "LIKELY_DEEPFAKE_OR_MANIPULATED"
-    elif score >= 60:
-        prediction = "HIGH_MANIPULATION_RISK"
-    elif score >= 40:
-        prediction = "SUSPICIOUS_IMAGE"
-    elif score >= 20:
-        prediction = "LOW_MANIPULATION_RISK"
-    else:
-        prediction = "NO_MAJOR_MANIPULATION_INDICATOR"
-
-    # -----------------------------------------------------
-    # Confidence
-    # -----------------------------------------------------
-
-    if score >= 80:
-        confidence = 0.90
-    elif score >= 60:
-        confidence = 0.82
-    elif score >= 40:
-        confidence = 0.72
-    elif score >= 20:
-        confidence = 0.62
-    else:
-        confidence = 0.55
-
-    # -----------------------------------------------------
-    # Recommendation
-    # -----------------------------------------------------
-
-    if severity == "CRITICAL":
-        recommendation = (
-            "Quarantine the media, flag the incident and perform "
-            "additional deepfake/identity verification."
-        )
-
-    elif severity == "HIGH":
-        recommendation = (
-            "Treat the image as suspicious and perform additional "
-            "identity and forensic verification."
-        )
-
-    elif severity == "MEDIUM":
-        recommendation = (
-            "Review the detected forensic indicators before trusting "
-            "the image for identity-sensitive purposes."
-        )
-
-    elif severity == "LOW":
-        recommendation = (
-            "Continue monitoring; the current indicators are weak."
-        )
-
-    else:
-        recommendation = (
-            "No major manipulation indicators were detected by the "
-            "current forensic rules."
-        )
-
-    features = {
-        "file_name": file_name,
-        "file_size": file_size,
-        "face_detected": bool(face_detected),
-        "multiple_faces": bool(multiple_faces),
-        "face_manipulation_indicator": bool(
-            face_manipulation_indicator
-        ),
-        "lighting_inconsistency": bool(
-            lighting_inconsistency
-        ),
-        "edge_artifact_indicator": bool(
-            edge_artifact_indicator
-        ),
-        "compression_anomaly": bool(
-            compression_anomaly
-        ),
-        "metadata_missing": bool(metadata_missing),
-        "identity_match_indicator": bool(
-            identity_match_indicator
-        ),
-        "face_swap_indicator": bool(
-            face_swap_indicator
-        ),
-        "suspicious_face_region": bool(
-            suspicious_face_region
-        ),
-        "visual_mismatch_indicator": bool(
-            visual_mismatch_indicator
-        ),
-    }
-
+    # The API will provide a temporary path through
+    # analyze_image_file() below.
     return {
-        "analysis_type": "image_forensics",
         "is_valid": True,
-        "risk_score": score,
-        "severity": severity,
-        "prediction": prediction,
-        "confidence": confidence,
-        "indicators": indicators,
-        "features": features,
-        "recommendation": recommendation,
+        "prediction": "READY_FOR_AI_ANALYSIS",
+        "risk_score": 0.0,
+        "severity": "SAFE",
     }
 
 
-# ---------------------------------------------------------
-# Video analysis
-# ---------------------------------------------------------
-
-def analyze_video(
+def analyze_image_file(
+    file_path: str,
     file_name: str,
     file_size: int,
-    *,
-    face_detected: bool = False,
-    multiple_faces: bool = False,
-    face_manipulation_indicator: bool = False,
-    lighting_inconsistency: bool = False,
-    edge_artifact_indicator: bool = False,
-    compression_anomaly: bool = False,
-    metadata_missing: bool = False,
-    face_swap_indicator: bool = False,
-    temporal_inconsistency: bool = False,
-    audio_visual_mismatch: bool = False,
 ) -> dict[str, Any]:
 
-    is_valid, error = _validate_file(
+    basic = analyze_image(
         file_name,
         file_size,
-        "video",
     )
 
-    if not is_valid:
+    if not basic["is_valid"]:
+        return basic
+
+    pipeline = prepare_image(
+        file_path
+    )
+
+    if not pipeline["success"]:
+
         return {
-            "analysis_type": "video_forensics",
             "is_valid": False,
+            "prediction": "MEDIA_READ_ERROR",
             "risk_score": 0.0,
             "severity": "SAFE",
-            "prediction": "INVALID_INPUT",
-            "confidence": 0.0,
-            "indicators": [],
-            "features": {},
-            "recommendation": error,
+            "error": pipeline["error"],
         }
 
-    score = 0.0
-    indicators: list[str] = []
+    if not pipeline["tensors"]:
 
-    if face_detected:
-        indicators.append("Face detected in the video.")
+        return {
+            "is_valid": True,
+            "prediction": "NO_FACE_DETECTED",
+            "risk_score": 0.0,
+            "severity": "SAFE",
+            "confidence": 0.50,
+            "indicators": [
+                "No detectable face was found."
+            ],
+            "features": {
+                "face_detected": False,
+                "face_count": 0,
+            },
+            "recommendation": (
+                "No face was available for deepfake "
+                "face analysis."
+            ),
+        }
 
-    if multiple_faces:
-        score += 5
-        indicators.append(
-            "Multiple faces detected in the video."
+    import torch
+
+    batch = torch.stack(
+        pipeline["tensors"]
+    )
+
+    ensemble = get_model_ensemble()
+
+    model_result = ensemble.predict(
+        batch
+    )
+
+    score = _clamp(
+        _model_score(
+            model_result
         )
+    )
 
-    if face_manipulation_indicator:
-        score += 30
+    severity = _severity(
+        score
+    )
+
+    indicators = []
+
+    if score >= 60:
         indicators.append(
-            "Possible facial manipulation detected."
+            "Multiple AI models indicate elevated manipulation probability."
         )
-
-    if face_swap_indicator:
-        score += 30
-        indicators.append(
-            "Possible face-swap indicator detected."
-        )
-
-    if lighting_inconsistency:
-        score += 15
-        indicators.append(
-            "Lighting inconsistency detected across video frames."
-        )
-
-    if edge_artifact_indicator:
-        score += 20
-        indicators.append(
-            "Possible facial edge or blending artifacts detected."
-        )
-
-    if compression_anomaly:
-        score += 15
-        indicators.append(
-            "Unusual video compression pattern detected."
-        )
-
-    if metadata_missing:
-        score += 3
-        indicators.append(
-            "Video metadata is missing or unavailable."
-        )
-
-    if temporal_inconsistency:
-        score += 25
-        indicators.append(
-            "Temporal inconsistency detected between video frames."
-        )
-
-    if audio_visual_mismatch:
-        score += 25
-        indicators.append(
-            "Possible audio-video synchronization mismatch detected."
-        )
-
-    # -----------------------------------------------------
-    # Correlations
-    # -----------------------------------------------------
-
-    if face_manipulation_indicator and temporal_inconsistency:
-        score += 15
-        indicators.append(
-            "Facial manipulation combined with temporal inconsistency."
-        )
-
-    if face_swap_indicator and audio_visual_mismatch:
-        score += 15
-        indicators.append(
-            "Face-swap indicator combined with audio-video mismatch."
-        )
-
-    if (
-        face_manipulation_indicator
-        and temporal_inconsistency
-        and edge_artifact_indicator
-    ):
-        score += 15
-        indicators.append(
-            "Multiple independent video-forensic indicators detected."
-        )
-
-    score = _clamp_score(score)
-    severity = _get_severity(score)
-
-    # -----------------------------------------------------
-    # Prediction
-    # -----------------------------------------------------
 
     if score >= 80:
-        prediction = "LIKELY_DEEPFAKE_OR_MANIPULATED"
-    elif score >= 60:
-        prediction = "HIGH_MANIPULATION_RISK"
-    elif score >= 40:
-        prediction = "SUSPICIOUS_VIDEO"
-    elif score >= 20:
-        prediction = "LOW_MANIPULATION_RISK"
-    else:
-        prediction = "NO_MAJOR_MANIPULATION_INDICATOR"
-
-    if score >= 80:
-        confidence = 0.90
-    elif score >= 60:
-        confidence = 0.82
-    elif score >= 40:
-        confidence = 0.72
-    elif score >= 20:
-        confidence = 0.62
-    else:
-        confidence = 0.55
-
-    if severity == "CRITICAL":
-        recommendation = (
-            "Quarantine the video, flag the incident and perform "
-            "deepfake and identity verification."
-        )
-    elif severity == "HIGH":
-        recommendation = (
-            "Treat the video as suspicious and perform additional "
-            "forensic verification."
-        )
-    elif severity == "MEDIUM":
-        recommendation = (
-            "Review the detected video-forensic indicators."
-        )
-    elif severity == "LOW":
-        recommendation = (
-            "Continue monitoring; the current indicators are weak."
-        )
-    else:
-        recommendation = (
-            "No major manipulation indicators were detected by the "
-            "current forensic rules."
+        indicators.append(
+            "Ensemble prediction strongly indicates possible deepfake manipulation."
         )
 
-    features = {
-        "file_name": file_name,
-        "file_size": file_size,
-        "face_detected": bool(face_detected),
-        "multiple_faces": bool(multiple_faces),
-        "face_manipulation_indicator": bool(
-            face_manipulation_indicator
-        ),
-        "lighting_inconsistency": bool(
-            lighting_inconsistency
-        ),
-        "edge_artifact_indicator": bool(
-            edge_artifact_indicator
-        ),
-        "compression_anomaly": bool(
-            compression_anomaly
-        ),
-        "metadata_missing": bool(metadata_missing),
-        "face_swap_indicator": bool(
-            face_swap_indicator
-        ),
-        "temporal_inconsistency": bool(
-            temporal_inconsistency
-        ),
-        "audio_visual_mismatch": bool(
-            audio_visual_mismatch
-        ),
-    }
+    if not model_result[
+        "is_fine_tuned"
+    ]:
+        indicators.append(
+            "Models are using pretrained backbone weights; "
+            "deepfake-specific fine-tuning is still required."
+        )
 
     return {
-        "analysis_type": "video_forensics",
+        "analysis_type": "advanced_deepfake_image",
         "is_valid": True,
         "risk_score": score,
         "severity": severity,
-        "prediction": prediction,
-        "confidence": confidence,
+        "prediction": _prediction(score),
+        "confidence": _confidence(score),
         "indicators": indicators,
-        "features": features,
-        "recommendation": recommendation,
+        "features": {
+            "face_detected": True,
+            "face_count": pipeline[
+                "face_count"
+            ],
+            "models_used": model_result[
+                "models_used"
+            ],
+            "fine_tuned_models": model_result[
+                "fine_tuned_models"
+            ],
+            "model_predictions": model_result[
+                "model_predictions"
+            ],
+            "ensemble_score": score,
+            "device": model_result[
+                "device"
+            ],
+        },
+        "recommendation": _recommendation(
+            severity
+        ),
     }
 
 
-# ---------------------------------------------------------
-# Compatibility wrapper
-# ---------------------------------------------------------
+def analyze_video_file(
+    file_path: str,
+    file_name: str,
+    file_size: int,
+    max_frames: int = 16,
+) -> dict[str, Any]:
 
+    extension = Path(
+        file_name
+    ).suffix.lower()
+
+    if file_size <= 0:
+        return {
+            "is_valid": False,
+            "prediction": "INVALID_INPUT",
+            "risk_score": 0.0,
+            "severity": "SAFE",
+            "error": "Video is empty.",
+        }
+
+    if file_size > MAX_FILE_SIZE:
+        return {
+            "is_valid": False,
+            "prediction": "INVALID_INPUT",
+            "risk_score": 0.0,
+            "severity": "SAFE",
+            "error": "Video exceeds 20 MB.",
+        }
+
+    if extension not in VIDEO_EXTENSIONS:
+        return {
+            "is_valid": False,
+            "prediction": "INVALID_INPUT",
+            "risk_score": 0.0,
+            "severity": "SAFE",
+            "error": "Unsupported video format.",
+        }
+
+    pipeline = prepare_video(
+        file_path,
+        max_frames=max_frames,
+    )
+
+    if not pipeline["tensors"]:
+
+        return {
+            "analysis_type": "advanced_deepfake_video",
+            "is_valid": True,
+            "risk_score": 0.0,
+            "severity": "SAFE",
+            "prediction": "NO_FACE_DETECTED",
+            "confidence": 0.50,
+            "indicators": [
+                "No detectable face was found in sampled frames."
+            ],
+            "features": {
+                "frames_analyzed": pipeline[
+                    "frames_analyzed"
+                ],
+                "face_frames": pipeline[
+                    "face_frames"
+                ],
+                "face_detected": False,
+            },
+            "recommendation": (
+                "No face was available for deepfake analysis."
+            ),
+        }
+
+    import torch
+
+    batch = torch.stack(
+        pipeline["tensors"]
+    )
+
+    ensemble = get_model_ensemble()
+
+    model_result = ensemble.predict(
+        batch
+    )
+
+    frame_scores = (
+        model_result[
+            "ensemble_scores"
+        ]
+    )
+
+    spatial_score = (
+        sum(frame_scores)
+        / len(frame_scores)
+    )
+
+    temporal_score = _temporal_score(
+        frame_scores
+    )
+
+    # Temporal signal has a lower weight because
+    # volatility alone is not proof of a deepfake.
+    final_score = _clamp(
+        (
+            spatial_score * 0.85
+            + temporal_score * 0.15
+        )
+    )
+
+    severity = _severity(
+        final_score
+    )
+
+    indicators = [
+        f"{len(frame_scores)} face frames analyzed by AI ensemble."
+    ]
+
+    if temporal_score >= 15:
+        indicators.append(
+            "Elevated temporal inconsistency signal detected."
+        )
+
+    if final_score >= 60:
+        indicators.append(
+            "AI ensemble indicates elevated deepfake probability."
+        )
+
+    if not model_result[
+        "is_fine_tuned"
+    ]:
+        indicators.append(
+            "Deepfake-specific model fine-tuning is still required."
+        )
+
+    return {
+        "analysis_type": "advanced_deepfake_video",
+        "is_valid": True,
+        "risk_score": final_score,
+        "severity": severity,
+        "prediction": _prediction(
+            final_score
+        ),
+        "confidence": _confidence(
+            final_score
+        ),
+        "indicators": indicators,
+        "features": {
+            "frames_analyzed": pipeline[
+                "frames_analyzed"
+            ],
+            "face_frames": pipeline[
+                "face_frames"
+            ],
+            "face_detected": pipeline[
+                "face_detected"
+            ],
+            "multiple_faces": pipeline[
+                "multiple_faces"
+            ],
+            "frame_scores": frame_scores,
+            "temporal_score": temporal_score,
+            "spatial_score": round(
+                spatial_score,
+                2,
+            ),
+            "models_used": model_result[
+                "models_used"
+            ],
+            "fine_tuned_models": model_result[
+                "fine_tuned_models"
+            ],
+            "model_predictions": model_result[
+                "model_predictions"
+            ],
+            "device": model_result[
+                "device"
+            ],
+        },
+        "recommendation": _recommendation(
+            severity
+        ),
+    }
+
+
+# Compatibility function.
 def analyze_media(
     file_name: str,
     file_size: int,
@@ -578,16 +596,21 @@ def analyze_media(
 ) -> dict[str, Any]:
 
     if media_type.lower() == "video":
-        return analyze_video(
+
+        return analyze_video_file(
+            kwargs["file_path"],
             file_name,
             file_size,
-            **kwargs,
+            kwargs.get(
+                "max_frames",
+                16,
+            ),
         )
 
-    return analyze_image(
+    return analyze_image_file(
+        kwargs["file_path"],
         file_name,
         file_size,
-        **kwargs,
     )
 
 
