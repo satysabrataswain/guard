@@ -1,22 +1,22 @@
+
 from django.urls import path
 
 from .views import (
-    MyAuditLogView,
-    AdminAuditLogView,
+    AuditLogDetailView,
+    AuditLogListView,
+    MyAuditLogListView,
 )
 
-
 urlpatterns = [
-
+    path("",AuditLogListView.as_view(),name="audit-log-list", ),
     path(
-        "my/",
-        MyAuditLogView.as_view(),
-        name="my-audit-logs",
+        "mine/",
+        MyAuditLogListView.as_view(),
+        name="my-audit-log-list",
     ),
-
     path(
-        "admin/",
-        AdminAuditLogView.as_view(),
-        name="admin-audit-logs",
+        "<int:pk>/",
+        AuditLogDetailView.as_view(),
+        name="audit-log-detail",
     ),
 ]

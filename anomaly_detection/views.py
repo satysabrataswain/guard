@@ -1,377 +1,914 @@
-from django.utils import timezone
-from datetime import timedelta
+from __future__ import annotations
 
-from rest_framework import status
+from typing import Any
+
+from django.db import transaction
+from rest_framework import generics, status
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from accounts.utils import get_client_ip
 from audit_logs.models import AuditLog
 
+from ai_engine.anomaly_model import (
+    analyze_behavior,
+    analyze_login,
+)
+from ai_engine.risk_engine import analyze_risk
+
+from incidents.models import (
+    Incident,
+    IncidentEvidence,
+    ResponseAction,
+)
+
+from threat_detection.models import (
+    Threat,
+    ThreatAnalysis,
+    ThreatEvidence,
+)
+
 from .models import (
-    UserBehaviour,
-    LoginActivity,
     Anomaly,
+    LoginActivity,
+    UserBehaviour,
 )
 
 from .serializers import (
-    UserBehaviourSerializer,
-    LoginActivitySerializer,
     AnomalySerializer,
+    LoginActivitySerializer,
+    UserBehaviourSerializer,
 )
 
 
-def get_severity(score):
-    if score >= 80:
-        return "CRITICAL"
+def _safe_float(
+    value: Any,
+    default: float = 0.0,
+) -> float:
+    try:
+        number = float(value)
+    except (
+        TypeError,
+        ValueError,
+    ):
+        return default
 
-    if score >= 60:
-        return "HIGH"
-
-    if score >= 40:
-        return "MEDIUM"
-
-    if score >= 20:
-        return "LOW"
-
-    return "SAFE"
-
-
-def get_client_ip(request):
-    forwarded = request.META.get("HTTP_X_FORWARDED_FOR")
-
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-
-    return request.META.get("REMOTE_ADDR")
-
-
-def analyse_login_anomaly(
-    user,
-    ip_address=None,
-    device_id="",
-    location="",
-):
-    score = 0
-    indicators = []
-
-    recent_time = timezone.now() - timedelta(hours=24)
-
-    recent_logins = LoginActivity.objects.filter(
-        user=user,
-        created_at__gte=recent_time,
+    return round(
+        max(
+            0.0,
+            min(
+                100.0,
+                number,
+            ),
+        ),
+        2,
     )
 
-    failed_count = recent_logins.filter(
-        status="FAILED"
-    ).count()
 
-    if failed_count >= 3:
-        score += 25
+def _normalize_confidence(
+    value: Any,
+) -> float:
+    try:
+        confidence = float(value)
+    except (
+        TypeError,
+        ValueError,
+    ):
+        return 0.0
 
-        indicators.append(
-            "Multiple failed login attempts detected"
+    if 0.0 <= confidence <= 1.0:
+        confidence *= 100.0
+
+    return round(
+        max(
+            0.0,
+            min(
+                100.0,
+                confidence,
+            ),
+        ),
+        2,
+    )
+
+
+def _bool_value(
+    value: Any,
+) -> bool:
+    if isinstance(
+        value,
+        bool,
+    ):
+        return value
+
+    if isinstance(
+        value,
+        (int, float),
+    ):
+        return bool(value)
+
+    if isinstance(
+        value,
+        str,
+    ):
+        return value.strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
+
+    return False
+
+
+def _create_threat(
+    user,
+    source_type: str,
+    input_data: dict,
+    result: dict,
+    risk: dict,
+) -> Threat:
+    score = _safe_float(
+        risk.get(
+            "risk_score",
+            0,
         )
+    )
 
-    if failed_count >= 5:
-        score += 20
-
-        indicators.append(
-            "High number of failed login attempts"
+    severity = str(
+        risk.get(
+            "severity",
+            "SAFE",
         )
+    ).upper()
 
-    if ip_address:
-        previous_ips = set(
-            recent_logins.exclude(
-                ip_address__isnull=True
-            ).values_list(
-                "ip_address",
-                flat=True,
-            )
-        )
+    valid_severities = dict(
+        Threat.SEVERITY_CHOICES
+    )
 
-        if previous_ips and ip_address not in previous_ips:
-            score += 20
+    if severity not in valid_severities:
+        severity = "SAFE"
 
-            indicators.append(
-                "Login from a previously unseen IP address"
-            )
+    indicators = result.get(
+        "indicators",
+        [],
+    )
 
-    if device_id:
-        previous_devices = set(
-            recent_logins.exclude(
-                device_id=""
-            ).values_list(
-                "device_id",
-                flat=True,
-            )
-        )
+    if not isinstance(
+        indicators,
+        list,
+    ):
+        indicators = []
 
-        if previous_devices and device_id not in previous_devices:
-            score += 20
+    clean_indicators = []
 
-            indicators.append(
-                "Login from a previously unseen device"
-            )
+    for indicator in indicators:
+        if indicator is None:
+            continue
 
-    if location:
-        previous_locations = set(
-            recent_logins.exclude(
-                location=""
-            ).values_list(
-                "location",
-                flat=True,
-            )
-        )
+        text = str(
+            indicator
+        ).strip()
 
-        if previous_locations and location not in previous_locations:
-            score += 15
-
-            indicators.append(
-                "Login from a previously unseen location"
+        if (
+            text
+            and text not in clean_indicators
+        ):
+            clean_indicators.append(
+                text
             )
 
-    score = min(score, 100)
-
-    severity = get_severity(score)
-
-    if indicators:
-        explanation = "; ".join(indicators)
-    else:
-        explanation = "No significant abnormal behaviour detected"
-
-    return score, severity, explanation, indicators
-
-
-class AnalyseLoginView(APIView):
-
-    permission_classes = [IsAuthenticated]
-
-    def post(self, request):
-
-        ip_address = request.data.get(
-            "ip_address"
-        ) or get_client_ip(request)
-
-        device_id = request.data.get(
-            "device_id",
+    explanation = str(
+        risk.get(
+            "explanation",
             "",
         )
+    )
 
-        location = request.data.get(
-            "location",
-            "",
+    if clean_indicators:
+        indicator_text = "; ".join(
+            clean_indicators[:10]
         )
 
-        user_agent = request.META.get(
-            "HTTP_USER_AGENT",
-            "",
-        )
+        if explanation:
+            explanation = (
+                f"{explanation} "
+                f"Key indicators: {indicator_text}"
+            )
+        else:
+            explanation = (
+                "Anomaly indicators detected: "
+                f"{indicator_text}"
+            )
 
-        score, severity, explanation, indicators = (
-            analyse_login_anomaly(
-                request.user,
-                ip_address,
-                device_id,
-                location,
+    return Threat.objects.create(
+        user=user,
+        threat_type="ANOMALY",
+        source_type=source_type,
+        input_data=str(
+            input_data
+        ),
+        risk_score=score,
+        severity=severity,
+        status="DETECTED",
+        explanation=explanation,
+    )
+
+
+def _save_threat_analysis(
+    threat: Threat,
+    model_name: str,
+    result: dict,
+) -> None:
+    if not isinstance(
+        result,
+        dict,
+    ):
+        result = {}
+
+    score = _safe_float(
+        result.get(
+            "risk_score",
+            result.get(
+                "score",
+                0,
+            ),
+        )
+    )
+
+    confidence = _normalize_confidence(
+        result.get(
+            "confidence",
+            0,
+        )
+    )
+
+    prediction = str(
+        result.get(
+            "prediction",
+            "UNKNOWN",
+        )
+    )[:100]
+
+    ThreatAnalysis.objects.create(
+        threat=threat,
+        model_name=model_name,
+        model_version="1.0-rule-engine",
+        prediction=prediction,
+        confidence=confidence,
+        score=score,
+        analysis_result=result,
+    )
+
+    indicators = result.get(
+        "indicators",
+        [],
+    )
+
+    if not isinstance(
+        indicators,
+        list,
+    ):
+        return
+
+    evidence_objects = []
+
+    for indicator in indicators:
+        if indicator is None:
+            continue
+
+        text = str(
+            indicator
+        ).strip()
+
+        if not text:
+            continue
+
+        evidence_objects.append(
+            ThreatEvidence(
+                threat=threat,
+                evidence_type=model_name,
+                evidence_value=text,
+                risk_contribution=score,
             )
         )
 
-        LoginActivity.objects.create(
+    if evidence_objects:
+        ThreatEvidence.objects.bulk_create(
+            evidence_objects
+        )
+
+
+def _create_incident(
+    threat: Threat,
+    risk: dict,
+) -> Incident | None:
+    if threat.severity not in {
+        "HIGH",
+        "CRITICAL",
+    }:
+        return None
+
+    incident = Incident.objects.create(
+        incident_type="ANOMALY",
+        title=(
+            f"{threat.severity} "
+            "Behaviour/Login Anomaly"
+        ),
+        description=threat.explanation,
+        severity=threat.severity,
+        status="OPEN",
+        risk_score=threat.risk_score,
+        created_by=threat.user,
+        source_type=threat.source_type,
+        source_id=threat.id,
+    )
+
+    for evidence in threat.evidence.all():
+        IncidentEvidence.objects.create(
+            incident=incident,
+            evidence_type=evidence.evidence_type,
+            evidence_value=evidence.evidence_value,
+            risk_contribution=evidence.risk_contribution,
+        )
+
+    action_mapping = {
+        "Revoke active sessions": "REVOKE_SESSION",
+        "Strengthen authentication": "STRENGTHEN_AUTH",
+        "Alert user": "ALERT_USER",
+        "Alert administrator": "ALERT_ADMIN",
+        "Escalate incident": "ESCALATE",
+        "Monitor": "MONITOR",
+        "Increase monitoring": "MONITOR",
+        "Request additional verification": (
+            "STRENGTHEN_AUTH"
+        ),
+        "Alert user if behaviour continues": (
+            "ALERT_USER"
+        ),
+    }
+
+    recommended_actions = risk.get(
+        "recommended_actions",
+        [],
+    )
+
+    if not isinstance(
+        recommended_actions,
+        list,
+    ):
+        recommended_actions = []
+
+    for action in recommended_actions:
+        action_type = action_mapping.get(
+            action
+        )
+
+        if not action_type:
+            continue
+
+        ResponseAction.objects.create(
+            incident=incident,
+            action_type=action_type,
+            description=(
+                "Recommended by automated "
+                f"anomaly analysis: {action}"
+            ),
+        )
+
+    return incident
+
+
+class LoginAnalysisView(APIView):
+    permission_classes = [
+        IsAuthenticated
+    ]
+
+    @transaction.atomic
+    def post(
+        self,
+        request,
+    ):
+        data = request.data
+
+        failed_attempts = data.get(
+            "failed_attempts",
+            0,
+        )
+
+        try:
+            failed_attempts = int(
+                failed_attempts
+            )
+        except (
+            TypeError,
+            ValueError,
+        ):
+            return Response(
+                {
+                    "detail": (
+                        "failed_attempts "
+                        "must be an integer."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if failed_attempts < 0:
+            return Response(
+                {
+                    "detail": (
+                        "failed_attempts "
+                        "cannot be negative."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        analysis_input = {
+            "failed_attempts": failed_attempts,
+            "new_ip": _bool_value(
+                data.get(
+                    "new_ip",
+                    False,
+                )
+            ),
+            "new_device": _bool_value(
+                data.get(
+                    "new_device",
+                    False,
+                )
+            ),
+            "new_location": _bool_value(
+                data.get(
+                    "new_location",
+                    False,
+                )
+            ),
+            "unusual_time": _bool_value(
+                data.get(
+                    "unusual_time",
+                    False,
+                )
+            ),
+            "impossible_travel": _bool_value(
+                data.get(
+                    "impossible_travel",
+                    False,
+                )
+            ),
+            "suspicious_network": _bool_value(
+                data.get(
+                    "suspicious_network",
+                    False,
+                )
+            ),
+        }
+
+        result = analyze_login(
+            **analysis_input
+        )
+
+        if not isinstance(
+            result,
+            dict,
+        ):
+            result = {}
+
+        model_score = _safe_float(
+            result.get(
+                "risk_score",
+                result.get(
+                    "score",
+                    0,
+                ),
+            )
+        )
+
+        risk = analyze_risk(
+            {
+                "LOGIN_ANOMALY_ENGINE":
+                    model_score
+            }
+        )
+
+        threat = _create_threat(
             user=request.user,
-            ip_address=ip_address,
-            user_agent=user_agent,
-            location=location,
-            device_id=device_id,
-            status="SUCCESS",
+            source_type="LOGIN",
+            input_data=analysis_input,
+            result=result,
+            risk=risk,
+        )
+
+        _save_threat_analysis(
+            threat=threat,
+            model_name="LOGIN_ANOMALY_ENGINE",
+            result=result,
+        )
+
+        incident = _create_incident(
+            threat=threat,
+            risk=risk,
+        )
+
+        login_activity = LoginActivity.objects.create(
+            user=request.user,
+            ip_address=data.get(
+                "ip_address"
+            )
+            or get_client_ip(request),
+            user_agent=data.get(
+                "user_agent"
+            )
+            or request.META.get(
+                "HTTP_USER_AGENT",
+                "",
+            ),
+            device_id=data.get(
+                "device_id",
+                "",
+            ),
+            location=data.get(
+                "location",
+                "",
+            ),
+            successful=data.get(
+                "successful",
+                True,
+            ),
+            failed_attempts=failed_attempts,
+            is_new_ip=analysis_input[
+                "new_ip"
+            ],
+            is_new_device=analysis_input[
+                "new_device"
+            ],
+            is_new_location=analysis_input[
+                "new_location"
+            ],
+            unusual_time=analysis_input[
+                "unusual_time"
+            ],
+            impossible_travel=analysis_input[
+                "impossible_travel"
+            ],
+            suspicious_network=analysis_input[
+                "suspicious_network"
+            ],
         )
 
         anomaly = Anomaly.objects.create(
             user=request.user,
-            anomaly_type="LOGIN_BEHAVIOUR",
-            risk_score=score,
-            severity=severity,
-            explanation=explanation,
+            anomaly_type="LOGIN",
+            risk_score=threat.risk_score,
+            severity=threat.severity,
+            description=threat.explanation,
+            detection_result=result,
         )
-
-        for indicator in indicators:
-            UserBehaviour.objects.create(
-                user=request.user,
-                activity_type="LOGIN",
-                ip_address=ip_address,
-                user_agent=user_agent,
-                location=location,
-                device_id=device_id,
-                activity_data={
-                    "indicator": indicator,
-                    "risk_contribution": 0,
-                },
-            )
 
         AuditLog.objects.create(
             user=request.user,
-            action="ANOMALY_DETECTED",
-            ip_address=ip_address,
-            user_agent=user_agent,
-            description=explanation,
+            action="LOGIN_ANOMALY_ANALYZED",
+            ip_address=get_client_ip(
+                request
+            ),
+            user_agent=request.META.get(
+                "HTTP_USER_AGENT",
+                "",
+            ),
+            description=(
+                "Login anomaly analysis completed. "
+                f"Threat ID: {threat.id}; "
+                f"score={threat.risk_score}; "
+                f"severity={threat.severity}"
+            ),
             status="SUCCESS",
         )
 
+        response_data = {
+            "message": (
+                "Login anomaly analysis completed."
+            ),
+            "login_activity_id": (
+                login_activity.id
+            ),
+            "anomaly_id": anomaly.id,
+            "threat_id": threat.id,
+            "risk_score": threat.risk_score,
+            "severity": threat.severity,
+            "prediction": result.get(
+                "prediction",
+                "UNKNOWN",
+            ),
+            "confidence": _normalize_confidence(
+                result.get(
+                    "confidence",
+                    0,
+                )
+            ),
+            "indicators": result.get(
+                "indicators",
+                [],
+            ),
+            "explanation": threat.explanation,
+            "recommended_actions": risk.get(
+                "recommended_actions",
+                [],
+            ),
+        }
+
+        if incident:
+            response_data["incident"] = {
+                "id": incident.id,
+                "severity": incident.severity,
+                "status": incident.status,
+            }
+
         return Response(
-            {
-                "message": "Login behaviour analysed",
-                "anomaly": AnomalySerializer(
-                    anomaly
-                ).data,
-                "indicators": indicators,
-            },
+            response_data,
             status=status.HTTP_201_CREATED,
         )
 
 
-class BehaviourCreateView(APIView):
+class BehaviourAnalysisView(APIView):
+    permission_classes = [
+        IsAuthenticated
+    ]
 
-    permission_classes = [IsAuthenticated]
+    @transaction.atomic
+    def post(
+        self,
+        request,
+    ):
+        data = request.data
 
-    def post(self, request):
+        analysis_input = {
+            "unusual_access": _bool_value(
+                data.get(
+                    "unusual_access",
+                    False,
+                )
+            ),
+            "unusual_resource_access": _bool_value(
+                data.get(
+                    "unusual_resource_access",
+                    False,
+                )
+            ),
+            "unusual_request_volume": _bool_value(
+                data.get(
+                    "unusual_request_volume",
+                    False,
+                )
+            ),
+            "new_device": _bool_value(
+                data.get(
+                    "new_device",
+                    False,
+                )
+            ),
+            "new_location": _bool_value(
+                data.get(
+                    "new_location",
+                    False,
+                )
+            ),
+            "suspicious_network": _bool_value(
+                data.get(
+                    "suspicious_network",
+                    False,
+                )
+            ),
+        }
 
-        serializer = UserBehaviourSerializer(
-            data=request.data
+        result = analyze_behavior(
+            **analysis_input
         )
 
-        if serializer.is_valid():
+        if not isinstance(
+            result,
+            dict,
+        ):
+            result = {}
 
-            behaviour = serializer.save(
-                user=request.user
+        model_score = _safe_float(
+            result.get(
+                "risk_score",
+                result.get(
+                    "score",
+                    0,
+                ),
             )
+        )
 
-            return Response(
-                UserBehaviourSerializer(
-                    behaviour
-                ).data,
-                status=status.HTTP_201_CREATED,
-            )
+        risk = analyze_risk(
+            {
+                "BEHAVIOUR_ANOMALY_ENGINE":
+                    model_score
+            }
+        )
+
+        threat = _create_threat(
+            user=request.user,
+            source_type="DEVICE",
+            input_data=analysis_input,
+            result=result,
+            risk=risk,
+        )
+
+        _save_threat_analysis(
+            threat=threat,
+            model_name="BEHAVIOUR_ANOMALY_ENGINE",
+            result=result,
+        )
+
+        incident = _create_incident(
+            threat=threat,
+            risk=risk,
+        )
+
+        behaviour = UserBehaviour.objects.create(
+            user=request.user,
+            unusual_access=analysis_input[
+                "unusual_access"
+            ],
+            unusual_resource_access=analysis_input[
+                "unusual_resource_access"
+            ],
+            unusual_request_volume=analysis_input[
+                "unusual_request_volume"
+            ],
+            new_device=analysis_input[
+                "new_device"
+            ],
+            new_location=analysis_input[
+                "new_location"
+            ],
+            suspicious_network=analysis_input[
+                "suspicious_network"
+            ],
+            risk_score=threat.risk_score,
+            severity=threat.severity,
+            analysis_result=result,
+        )
+
+        anomaly = Anomaly.objects.create(
+            user=request.user,
+            anomaly_type="BEHAVIOUR",
+            risk_score=threat.risk_score,
+            severity=threat.severity,
+            description=threat.explanation,
+            detection_result=result,
+        )
+
+        AuditLog.objects.create(
+            user=request.user,
+            action="BEHAVIOUR_ANOMALY_ANALYZED",
+            ip_address=get_client_ip(
+                request
+            ),
+            user_agent=request.META.get(
+                "HTTP_USER_AGENT",
+                "",
+            ),
+            description=(
+                "Behaviour anomaly analysis completed. "
+                f"Threat ID: {threat.id}; "
+                f"score={threat.risk_score}; "
+                f"severity={threat.severity}"
+            ),
+            status="SUCCESS",
+        )
+
+        response_data = {
+            "message": (
+                "Behaviour anomaly analysis completed."
+            ),
+            "behaviour_id": behaviour.id,
+            "anomaly_id": anomaly.id,
+            "threat_id": threat.id,
+            "risk_score": threat.risk_score,
+            "severity": threat.severity,
+            "prediction": result.get(
+                "prediction",
+                "UNKNOWN",
+            ),
+            "confidence": _normalize_confidence(
+                result.get(
+                    "confidence",
+                    0,
+                )
+            ),
+            "indicators": result.get(
+                "indicators",
+                [],
+            ),
+            "explanation": threat.explanation,
+            "recommended_actions": risk.get(
+                "recommended_actions",
+                [],
+            ),
+        }
+
+        if incident:
+            response_data["incident"] = {
+                "id": incident.id,
+                "severity": incident.severity,
+                "status": incident.status,
+            }
 
         return Response(
-            serializer.errors,
-            status=status.HTTP_400_BAD_REQUEST,
+            response_data,
+            status=status.HTTP_201_CREATED,
         )
 
 
-class LoginActivityCreateView(APIView):
+class LoginActivityHistoryView(
+    generics.ListAPIView
+):
+    serializer_class = LoginActivitySerializer
+    permission_classes = [
+        IsAuthenticated
+    ]
 
-    permission_classes = [IsAuthenticated]
-
-    def post(self, request):
-
-        serializer = LoginActivitySerializer(
-            data=request.data
-        )
-
-        if serializer.is_valid():
-
-            activity = serializer.save(
-                user=request.user
-            )
-
-            return Response(
-                LoginActivitySerializer(
-                    activity
-                ).data,
-                status=status.HTTP_201_CREATED,
-            )
-
-        return Response(
-            serializer.errors,
-            status=status.HTTP_400_BAD_REQUEST,
+    def get_queryset(self):
+        return LoginActivity.objects.filter(
+            user=self.request.user
+        ).order_by(
+            "-created_at"
         )
 
 
-class AnomalyHistoryView(APIView):
+class LoginActivityDetailView(
+    generics.RetrieveAPIView
+):
+    serializer_class = LoginActivitySerializer
+    permission_classes = [
+        IsAuthenticated
+    ]
 
-    permission_classes = [IsAuthenticated]
+    def get_queryset(self):
+        return LoginActivity.objects.filter(
+            user=self.request.user
+        )
 
-    def get(self, request):
 
-        anomalies = Anomaly.objects.filter(
-            user=request.user
+class BehaviourHistoryView(
+    generics.ListAPIView
+):
+    serializer_class = UserBehaviourSerializer
+    permission_classes = [
+        IsAuthenticated
+    ]
+
+    def get_queryset(self):
+        return UserBehaviour.objects.filter(
+            user=self.request.user
+        ).order_by(
+            "-created_at"
+        )
+
+
+class BehaviourDetailView(
+    generics.RetrieveAPIView
+):
+    serializer_class = UserBehaviourSerializer
+    permission_classes = [
+        IsAuthenticated
+    ]
+
+    def get_queryset(self):
+        return UserBehaviour.objects.filter(
+            user=self.request.user
+        )
+
+
+class AnomalyHistoryView(
+    generics.ListAPIView
+):
+    serializer_class = AnomalySerializer
+    permission_classes = [
+        IsAuthenticated
+    ]
+
+    def get_queryset(self):
+        return Anomaly.objects.filter(
+            user=self.request.user
         ).order_by(
             "-detected_at"
         )
 
-        serializer = AnomalySerializer(
-            anomalies,
-            many=True,
-        )
 
-        return Response(
-            serializer.data,
-            status=status.HTTP_200_OK,
-        )
+class AnomalyDetailView(
+    generics.RetrieveAPIView
+):
+    serializer_class = AnomalySerializer
+    permission_classes = [
+        IsAuthenticated
+    ]
 
-
-class AnomalyDetailView(APIView):
-
-    permission_classes = [IsAuthenticated]
-
-    def get(self, request, pk):
-
-        try:
-            anomaly = Anomaly.objects.get(
-                pk=pk,
-                user=request.user,
-            )
-
-        except Anomaly.DoesNotExist:
-
-            return Response(
-                {
-                    "detail": "Anomaly not found."
-                },
-                status=status.HTTP_404_NOT_FOUND,
-            )
-
-        return Response(
-            AnomalySerializer(anomaly).data,
-            status=status.HTTP_200_OK,
-        )
-
-
-class BehaviourHistoryView(APIView):
-
-    permission_classes = [IsAuthenticated]
-
-    def get(self, request):
-
-        records = UserBehaviour.objects.filter(
-            user=request.user
-        ).order_by(
-            "-created_at"
-        )
-
-        return Response(
-            UserBehaviourSerializer(
-                records,
-                many=True,
-            ).data
-        )
-
-
-class LoginHistoryView(APIView):
-
-    permission_classes = [IsAuthenticated]
-
-    def get(self, request):
-
-        records = LoginActivity.objects.filter(
-            user=request.user
-        ).order_by(
-            "-created_at"
-        )
-
-        return Response(
-            LoginActivitySerializer(
-                records,
-                many=True,
-            ).data
+    def get_queryset(self):
+        return Anomaly.objects.filter(
+            user=self.request.user
         )

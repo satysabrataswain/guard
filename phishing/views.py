@@ -1,548 +1,925 @@
-import ipaddress
-from urllib.parse import urlparse
+import json
+from typing import Any
 
-from django.core.validators import validate_email
-from django.core.exceptions import ValidationError
-
+from django.db import transaction
 from rest_framework import generics, status
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from accounts.utils import get_client_ip
+from audit_logs.models import AuditLog
+
+from ai_engine.nlp_model import analyze_email
+from ai_engine.phishing_model import analyze_url
+from ai_engine.risk_engine import analyze_risk
+
+from incidents.models import (
+    Incident,
+    IncidentEvidence,
+    ResponseAction,
+)
+
+from threat_detection.models import (
+    Threat,
+    ThreatAnalysis,
+    ThreatEvidence,
+)
+
 from .models import (
+    EmailAnalysis,
     PhishingScan,
     URLAnalysis,
-    EmailAnalysis,
 )
 
 from .serializers import (
+    EmailAnalysisSerializer,
     PhishingScanSerializer,
+    URLAnalysisSerializer,
 )
 
-from audit_logs.models import AuditLog
-from accounts.utils import get_client_ip
+
+def _safe_float(
+    value: Any,
+    default: float = 0.0,
+) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+
+    return round(
+        max(
+            0.0,
+            min(
+                100.0,
+                number,
+            ),
+        ),
+        2,
+    )
 
 
-SUSPICIOUS_KEYWORDS = [
-    "login",
-    "verify",
-    "verification",
-    "account",
-    "password",
-    "secure",
-    "security",
-    "update",
-    "confirm",
-    "urgent",
-    "wallet",
-    "bank",
-    "payment",
-    "signin",
-]
+def _normalize_confidence(
+    value: Any,
+) -> float:
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
-URL_SHORTENERS = [
-    "bit.ly",
-    "tinyurl.com",
-    "t.co",
-    "goo.gl",
-    "ow.ly",
-    "is.gd",
-    "buff.ly",
-]
+    if 0.0 <= confidence <= 1.0:
+        confidence *= 100.0
 
-URGENT_KEYWORDS = [
-    "urgent",
-    "immediately",
-    "action required",
-    "account suspended",
-    "account blocked",
-    "verify now",
-    "last warning",
-]
-
-ATTACHMENT_KEYWORDS = [
-    "attachment",
-    ".exe",
-    ".zip",
-    ".rar",
-    ".scr",
-    ".js",
-    ".bat",
-    ".docm",
-]
+    return round(
+        max(
+            0.0,
+            min(
+                100.0,
+                confidence,
+            ),
+        ),
+        2,
+    )
 
 
-def get_severity(score):
-
-    if score <= 19:
-        return "SAFE"
-
-    if score <= 39:
-        return "LOW"
-
-    if score <= 59:
-        return "MEDIUM"
-
-    if score <= 79:
-        return "HIGH"
-
-    return "CRITICAL"
-
-
-def detect_ip_address(hostname):
-
-    if not hostname:
-        return False
+def _stringify_input(
+    value: Any,
+) -> str:
+    if isinstance(value, str):
+        return value
 
     try:
-        ipaddress.ip_address(hostname)
-        return True
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            default=str,
+        )
+    except (
+        TypeError,
+        ValueError,
+    ):
+        return str(value)
 
-    except ValueError:
-        return False
+
+def _create_threat(
+    user,
+    threat_type: str,
+    source_type: str,
+    input_data: Any,
+    result: dict,
+    risk: dict,
+) -> Threat:
+    risk_score = _safe_float(
+        risk.get(
+            "risk_score",
+            0,
+        )
+    )
+
+    severity = str(
+        risk.get(
+            "severity",
+            "SAFE",
+        )
+    ).upper()
+
+    valid_severities = dict(
+        Threat.SEVERITY_CHOICES
+    )
+
+    if severity not in valid_severities:
+        severity = "SAFE"
+
+    explanation = str(
+        risk.get(
+            "explanation",
+            "",
+        )
+    )
+
+    indicators = result.get(
+        "indicators",
+        [],
+    )
+
+    if not isinstance(
+        indicators,
+        list,
+    ):
+        indicators = []
+
+    clean_indicators = []
+
+    for indicator in indicators:
+        text = str(
+            indicator
+        ).strip()
+
+        if (
+            text
+            and text not in clean_indicators
+        ):
+            clean_indicators.append(
+                text
+            )
+
+    if clean_indicators:
+        indicator_text = "; ".join(
+            clean_indicators[:10]
+        )
+
+        if explanation:
+            explanation = (
+                f"{explanation} "
+                f"Key indicators: {indicator_text}"
+            )
+        else:
+            explanation = (
+                "Security indicators detected: "
+                f"{indicator_text}"
+            )
+
+    threat = Threat.objects.create(
+        user=user,
+        threat_type=threat_type,
+        source_type=source_type,
+        input_data=_stringify_input(
+            input_data
+        ),
+        risk_score=risk_score,
+        severity=severity,
+        status="DETECTED",
+        explanation=explanation,
+    )
+
+    return threat
 
 
-class PhishingScanListView(
-    generics.ListAPIView
+def _save_analysis_records(
+    threat: Threat,
+    model_name: str,
+    result: dict,
+) -> None:
+    if not isinstance(
+        result,
+        dict,
+    ):
+        result = {}
+
+    score = _safe_float(
+        result.get(
+            "risk_score",
+            result.get(
+                "score",
+                0,
+            ),
+        )
+    )
+
+    confidence = _normalize_confidence(
+        result.get(
+            "confidence",
+            0,
+        )
+    )
+
+    prediction = str(
+        result.get(
+            "prediction",
+            "UNKNOWN",
+        )
+    )[:100]
+
+    ThreatAnalysis.objects.create(
+        threat=threat,
+        model_name=model_name,
+        model_version="1.0-rule-engine",
+        prediction=prediction,
+        confidence=confidence,
+        score=score,
+        analysis_result=result,
+    )
+
+    indicators = result.get(
+        "indicators",
+        [],
+    )
+
+    if not isinstance(
+        indicators,
+        list,
+    ):
+        return
+
+    evidence = []
+
+    for indicator in indicators:
+        if indicator is None:
+            continue
+
+        value = str(
+            indicator
+        ).strip()
+
+        if not value:
+            continue
+
+        evidence.append(
+            ThreatEvidence(
+                threat=threat,
+                evidence_type=model_name,
+                evidence_value=value,
+                risk_contribution=score,
+            )
+        )
+
+    if evidence:
+        ThreatEvidence.objects.bulk_create(
+            evidence
+        )
+
+
+def _create_incident_if_required(
+    threat: Threat,
+    risk: dict,
+) -> Incident | None:
+    if threat.severity not in {
+        "HIGH",
+        "CRITICAL",
+    }:
+        return None
+
+    incident = Incident.objects.create(
+        incident_type=threat.threat_type,
+        title=(
+            f"{threat.severity} "
+            f"{threat.threat_type.replace('_', ' ').title()}"
+        ),
+        description=threat.explanation,
+        severity=threat.severity,
+        status="OPEN",
+        risk_score=threat.risk_score,
+        created_by=threat.user,
+        source_type=threat.source_type,
+        source_id=threat.id,
+    )
+
+    for evidence in threat.evidence.all():
+        IncidentEvidence.objects.create(
+            incident=incident,
+            evidence_type=evidence.evidence_type,
+            evidence_value=evidence.evidence_value,
+            risk_contribution=evidence.risk_contribution,
+        )
+
+    action_mapping = {
+        "Block suspicious resource": "BLOCK_URL",
+        "Quarantine suspicious content": "QUARANTINE_EMAIL",
+        "Revoke active sessions": "REVOKE_SESSION",
+        "Strengthen authentication": "STRENGTHEN_AUTH",
+        "Alert user": "ALERT_USER",
+        "Alert administrator": "ALERT_ADMIN",
+        "Escalate incident": "ESCALATE",
+        "Monitor": "MONITOR",
+        "Continue monitoring": "MONITOR",
+        "Increase monitoring": "MONITOR",
+        "Request additional verification": "STRENGTHEN_AUTH",
+        "Alert user if behaviour continues": "ALERT_USER",
+    }
+
+    recommended_actions = risk.get(
+        "recommended_actions",
+        [],
+    )
+
+    if not isinstance(
+        recommended_actions,
+        list,
+    ):
+        recommended_actions = []
+
+    for action in recommended_actions:
+        action_type = action_mapping.get(
+            action
+        )
+
+        if not action_type:
+            continue
+
+        ResponseAction.objects.create(
+            incident=incident,
+            action_type=action_type,
+            description=(
+                "Recommended by automated "
+                f"security analysis: {action}"
+            ),
+        )
+
+    return incident
+
+
+class PhishingScanListCreateView(
+    generics.ListCreateAPIView
 ):
-
     serializer_class = PhishingScanSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [
+        IsAuthenticated
+    ]
 
     def get_queryset(self):
-
         return PhishingScan.objects.filter(
             user=self.request.user
-        ).order_by("-created_at")
+        ).order_by(
+            "-created_at"
+        )
+
+    def perform_create(
+        self,
+        serializer,
+    ):
+        scan = serializer.save(
+            user=self.request.user
+        )
+
+        AuditLog.objects.create(
+            user=self.request.user,
+            action="PHISHING_SCAN_CREATED",
+            ip_address=get_client_ip(
+                self.request
+            ),
+            user_agent=self.request.META.get(
+                "HTTP_USER_AGENT",
+                "",
+            ),
+            description=(
+                f"Phishing scan created: "
+                f"{scan.id}"
+            ),
+            status="SUCCESS",
+        )
 
 
 class PhishingScanDetailView(
-    generics.RetrieveAPIView
+    generics.RetrieveUpdateAPIView
 ):
-
     serializer_class = PhishingScanSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [
+        IsAuthenticated
+    ]
 
     def get_queryset(self):
-
         return PhishingScan.objects.filter(
             user=self.request.user
         )
 
-
-class URLAnalyzeView(APIView):
-
-    permission_classes = [IsAuthenticated]
-
-    def post(self, request):
-
-        url = request.data.get("url")
-
-        if not url:
-
-            return Response(
-                {
-                    "detail":
-                    "url is required."
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        parsed = urlparse(url)
-
-        if parsed.scheme not in [
-            "http",
-            "https",
-        ] or not parsed.netloc:
-
-            return Response(
-                {
-                    "detail":
-                    "Invalid URL."
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        hostname = parsed.hostname or ""
-
-        lower_url = url.lower()
-
-        score = 0
-        evidence = []
-
-        uses_https = (
-            parsed.scheme == "https"
-        )
-
-        if not uses_https:
-
-            score += 15
-
-            evidence.append(
-                "URL does not use HTTPS."
-            )
-
-        url_length = len(url)
-
-        if url_length > 100:
-
-            score += 15
-
-            evidence.append(
-                "URL is unusually long."
-            )
-
-        elif url_length > 75:
-
-            score += 8
-
-            evidence.append(
-                "URL is longer than normal."
-            )
-
-        has_ip = detect_ip_address(
-            hostname
-        )
-
-        if has_ip:
-
-            score += 25
-
-            evidence.append(
-                "URL uses an IP address instead of a domain."
-            )
-
-        has_keyword = any(
-            keyword in lower_url
-            for keyword in SUSPICIOUS_KEYWORDS
-        )
-
-        if has_keyword:
-
-            score += 15
-
-            evidence.append(
-                "URL contains security-related keywords."
-            )
-
-        has_shortener = any(
-            hostname.lower().endswith(
-                shortener
-            )
-            for shortener in URL_SHORTENERS
-        )
-
-        if has_shortener:
-
-            score += 10
-
-            evidence.append(
-                "URL uses a URL shortening service."
-            )
-
-        if "@" in url:
-
-            score += 20
-
-            evidence.append(
-                "URL contains an @ character."
-            )
-
-        if url.count(".") > 4:
-
-            score += 10
-
-            evidence.append(
-                "URL contains an unusually high number of subdomains."
-            )
-
-        score = min(score, 100)
-
-        result = get_severity(score)
-
-        if not evidence:
-
-            explanation = (
-                "No obvious phishing indicators "
-                "were detected by the initial URL analysis."
-            )
-
-        else:
-
-            explanation = " ".join(evidence)
-
-        scan = PhishingScan.objects.create(
-            user=request.user,
-            scan_type="URL",
-            input_data=url,
-            risk_score=score,
-            result=result,
-            explanation=explanation,
-            status="COMPLETED",
-        )
-
-        URLAnalysis.objects.create(
-            scan=scan,
-            domain=hostname,
-            uses_https=uses_https,
-            url_length=url_length,
-            has_ip_address=has_ip,
-            has_suspicious_keyword=has_keyword,
-            has_shortener=has_shortener,
-            redirect_count=0,
-            analysis_details={
-                "evidence": evidence,
-                "note": (
-                    "Initial analysis only. "
-                    "Domain reputation, redirect "
-                    "chain and AI model analysis "
-                    "will be added later."
-                ),
-            },
-        )
+    def perform_update(
+        self,
+        serializer,
+    ):
+        scan = serializer.save()
 
         AuditLog.objects.create(
-            user=request.user,
-            action="PHISHING_SCAN",
-            ip_address=get_client_ip(request),
-            user_agent=request.META.get(
+            user=self.request.user,
+            action="PHISHING_SCAN_UPDATED",
+            ip_address=get_client_ip(
+                self.request
+            ),
+            user_agent=self.request.META.get(
                 "HTTP_USER_AGENT",
                 "",
             ),
             description=(
-                f"URL phishing scan performed. "
-                f"Scan ID: {scan.id}"
+                f"Phishing scan updated: "
+                f"{scan.id}"
             ),
             status="SUCCESS",
-        )
-
-        return Response(
-            {
-                "message":
-                "URL analysis completed.",
-
-                "scan":
-                PhishingScanSerializer(
-                    scan
-                ).data,
-            },
-            status=status.HTTP_201_CREATED,
-        )
-
-
-class EmailAnalyzeView(APIView):
-
-    permission_classes = [IsAuthenticated]
-
-    def post(self, request):
-
-        sender = request.data.get(
-            "sender",
-            "",
-        )
-
-        subject = request.data.get(
-            "subject",
-            "",
-        )
-
-        body = request.data.get(
-            "body",
-            "",
-        )
-
-        if not subject and not body:
-
-            return Response(
-                {
-                    "detail":
-                    "subject or body is required."
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        if sender:
-
-            try:
-
-                validate_email(sender)
-
-            except ValidationError:
-
-                return Response(
-                    {
-                        "detail":
-                        "Invalid sender email."
-                    },
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-
-        full_text = (
-            f"{subject} {body}"
-        ).lower()
-
-        score = 0
-        evidence = []
-
-        has_suspicious_keyword = any(
-            keyword in full_text
-            for keyword in SUSPICIOUS_KEYWORDS
-        )
-
-        if has_suspicious_keyword:
-
-            score += 15
-
-            evidence.append(
-                "Security or account-related keywords detected."
-            )
-
-        has_urgent_language = any(
-            keyword in full_text
-            for keyword in URGENT_KEYWORDS
-        )
-
-        if has_urgent_language:
-
-            score += 25
-
-            evidence.append(
-                "Urgent or threatening language detected."
-            )
-
-        has_suspicious_link = (
-            "http://" in full_text
-            or "https://" in full_text
-            or "bit.ly/" in full_text
-            or "tinyurl.com/" in full_text
-        )
-
-        if has_suspicious_link:
-
-            score += 20
-
-            evidence.append(
-                "Link detected in the message."
-            )
-
-        has_attachment_warning = any(
-            keyword in full_text
-            for keyword in ATTACHMENT_KEYWORDS
-        )
-
-        if has_attachment_warning:
-
-            score += 20
-
-            evidence.append(
-                "Potentially risky attachment or file type detected."
-            )
-
-        if sender:
-
-            sender_domain = sender.split("@")[-1].lower()
-
-            if any(
-                brand in sender_domain
-                for brand in [
-                    "paypal",
-                    "microsoft",
-                    "google",
-                    "amazon",
-                    "apple",
-                ]
-            ):
-
-                pass
-
-        score = min(score, 100)
-
-        result = get_severity(score)
-
-        if not evidence:
-
-            explanation = (
-                "No obvious phishing indicators "
-                "were detected by the initial email analysis."
-            )
-
-        else:
-
-            explanation = " ".join(evidence)
-
-        scan = PhishingScan.objects.create(
-            user=request.user,
-            scan_type="EMAIL",
-            input_data=body,
-            risk_score=score,
-            result=result,
-            explanation=explanation,
-            status="COMPLETED",
-        )
-
-        EmailAnalysis.objects.create(
-            scan=scan,
-            sender=sender,
-            subject=subject,
-            has_suspicious_keyword=(
-                has_suspicious_keyword
-            ),
-            has_urgent_language=(
-                has_urgent_language
-            ),
-            has_suspicious_link=(
-                has_suspicious_link
-            ),
-            has_attachment_warning=(
-                has_attachment_warning
-            ),
-            analysis_details={
-                "evidence": evidence,
-                "note": (
-                    "Initial NLP/rule-based analysis. "
-                    "AI NLP model will be connected later."
-                ),
-            },
-        )
-
-        AuditLog.objects.create(
-            user=request.user,
-            action="PHISHING_SCAN",
-            ip_address=get_client_ip(request),
-            user_agent=request.META.get(
-                "HTTP_USER_AGENT",
-                "",
-            ),
-            description=(
-                f"Email phishing scan performed. "
-                f"Scan ID: {scan.id}"
-            ),
-            status="SUCCESS",
-        )
-
-        return Response(
-            {
-                "message":
-                "Email analysis completed.",
-
-                "scan":
-                PhishingScanSerializer(
-                    scan
-                ).data,
-            },
-            status=status.HTTP_201_CREATED,
         )
 
 
 class PhishingScanDeleteView(
     generics.DestroyAPIView
 ):
-
     serializer_class = PhishingScanSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [
+        IsAuthenticated
+    ]
 
     def get_queryset(self):
+        return PhishingScan.objects.filter(
+            user=self.request.user
+        )
 
+    def perform_destroy(
+        self,
+        instance,
+    ):
+        scan_id = instance.id
+
+        instance.delete()
+
+        AuditLog.objects.create(
+            user=self.request.user,
+            action="PHISHING_SCAN_DELETED",
+            ip_address=get_client_ip(
+                self.request
+            ),
+            user_agent=self.request.META.get(
+                "HTTP_USER_AGENT",
+                "",
+            ),
+            description=(
+                f"Phishing scan deleted: "
+                f"{scan_id}"
+            ),
+            status="SUCCESS",
+        )
+
+
+class URLAnalysisView(APIView):
+    permission_classes = [
+        IsAuthenticated
+    ]
+
+    @transaction.atomic
+    def post(
+        self,
+        request,
+    ):
+        url = request.data.get(
+            "url"
+        )
+
+        if not url:
+            return Response(
+                {
+                    "detail": (
+                        "url is required."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if not isinstance(
+            url,
+            str,
+        ):
+            return Response(
+                {
+                    "detail": (
+                        "url must be a string."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        url = url.strip()
+
+        if not url:
+            return Response(
+                {
+                    "detail": (
+                        "url cannot be empty."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        result = analyze_url(
+            url
+        )
+
+        if not isinstance(
+            result,
+            dict,
+        ):
+            result = {}
+
+        raw_score = result.get(
+            "risk_score",
+            result.get(
+                "score",
+                0,
+            ),
+        )
+
+        risk = analyze_risk(
+            {
+                "URL_PHISHING_ENGINE":
+                    _safe_float(
+                        raw_score
+                    )
+            }
+        )
+
+        threat = _create_threat(
+            user=request.user,
+            threat_type="PHISHING"
+            if risk["risk_score"] >= 40
+            else "MALICIOUS_URL",
+            source_type="URL",
+            input_data=url,
+            result=result,
+            risk=risk,
+        )
+
+        _save_analysis_records(
+            threat=threat,
+            model_name="URL_PHISHING_ENGINE",
+            result=result,
+        )
+
+        incident = (
+            _create_incident_if_required(
+                threat,
+                risk,
+            )
+        )
+
+        scan = PhishingScan.objects.create(
+            user=request.user,
+            scan_type="URL",
+            target=url,
+            risk_score=threat.risk_score,
+            severity=threat.severity,
+            result=result,
+        )
+
+        URLAnalysis.objects.create(
+            scan=scan,
+            url=url,
+            risk_score=threat.risk_score,
+            prediction=str(
+                result.get(
+                    "prediction",
+                    "UNKNOWN",
+                )
+            ),
+            confidence=_normalize_confidence(
+                result.get(
+                    "confidence",
+                    0,
+                )
+            ),
+            indicators=result.get(
+                "indicators",
+                [],
+            ),
+            features=result.get(
+                "features",
+                {},
+            ),
+            recommendation=result.get(
+                "recommendation",
+                "",
+            ),
+        )
+
+        AuditLog.objects.create(
+            user=request.user,
+            action="URL_ANALYZED",
+            ip_address=get_client_ip(
+                request
+            ),
+            user_agent=request.META.get(
+                "HTTP_USER_AGENT",
+                "",
+            ),
+            description=(
+                f"URL analysis completed. "
+                f"Threat ID: {threat.id}; "
+                f"score={threat.risk_score}; "
+                f"severity={threat.severity}"
+            ),
+            status="SUCCESS",
+        )
+
+        response_data = {
+            "message": (
+                "URL analysis completed."
+            ),
+            "url": url,
+            "risk_score": threat.risk_score,
+            "severity": threat.severity,
+            "prediction": result.get(
+                "prediction",
+                "UNKNOWN",
+            ),
+            "confidence": _normalize_confidence(
+                result.get(
+                    "confidence",
+                    0,
+                )
+            ),
+            "indicators": result.get(
+                "indicators",
+                [],
+            ),
+            "features": result.get(
+                "features",
+                {},
+            ),
+            "recommendation": result.get(
+                "recommendation",
+                "",
+            ),
+            "explanation": threat.explanation,
+            "recommended_actions": risk.get(
+                "recommended_actions",
+                [],
+            ),
+            "threat_id": threat.id,
+            "scan_id": scan.id,
+        }
+
+        if incident:
+            response_data["incident"] = {
+                "id": incident.id,
+                "severity": incident.severity,
+                "status": incident.status,
+            }
+
+        return Response(
+            response_data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class EmailAnalysisView(APIView):
+    permission_classes = [
+        IsAuthenticated
+    ]
+
+    @transaction.atomic
+    def post(
+        self,
+        request,
+    ):
+        subject = str(
+            request.data.get(
+                "subject",
+                "",
+            )
+        ).strip()
+
+        body = str(
+            request.data.get(
+                "body",
+                "",
+            )
+        ).strip()
+
+        sender = str(
+            request.data.get(
+                "sender",
+                "",
+            )
+        ).strip()
+
+        if not subject and not body:
+            return Response(
+                {
+                    "detail": (
+                        "subject or body "
+                        "is required."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        email_payload = {
+            "subject": subject,
+            "body": body,
+            "sender": sender,
+        }
+
+        result = analyze_email(
+            email_payload
+        )
+
+        if not isinstance(
+            result,
+            dict,
+        ):
+            result = {}
+
+        raw_score = result.get(
+            "risk_score",
+            result.get(
+                "score",
+                0,
+            ),
+        )
+
+        risk = analyze_risk(
+            {
+                "EMAIL_NLP_ENGINE":
+                    _safe_float(
+                        raw_score
+                    )
+            }
+        )
+
+        threat = _create_threat(
+            user=request.user,
+            threat_type="SUSPICIOUS_EMAIL",
+            source_type="EMAIL",
+            input_data=email_payload,
+            result=result,
+            risk=risk,
+        )
+
+        _save_analysis_records(
+            threat=threat,
+            model_name="EMAIL_NLP_ENGINE",
+            result=result,
+        )
+
+        incident = (
+            _create_incident_if_required(
+                threat,
+                risk,
+            )
+        )
+
+        scan = PhishingScan.objects.create(
+            user=request.user,
+            scan_type="EMAIL",
+            target=sender or "EMAIL_CONTENT",
+            risk_score=threat.risk_score,
+            severity=threat.severity,
+            result=result,
+        )
+
+        email_analysis = EmailAnalysis.objects.create(
+            scan=scan,
+            sender=sender,
+            subject=subject,
+            body=body,
+            risk_score=threat.risk_score,
+            prediction=str(
+                result.get(
+                    "prediction",
+                    "UNKNOWN",
+                )
+            ),
+            confidence=_normalize_confidence(
+                result.get(
+                    "confidence",
+                    0,
+                )
+            ),
+            indicators=result.get(
+                "indicators",
+                [],
+            ),
+            entities=result.get(
+                "entities",
+                {},
+            ),
+            recommendation=result.get(
+                "recommendation",
+                "",
+            ),
+        )
+
+        AuditLog.objects.create(
+            user=request.user,
+            action="EMAIL_ANALYZED",
+            ip_address=get_client_ip(
+                request
+            ),
+            user_agent=request.META.get(
+                "HTTP_USER_AGENT",
+                "",
+            ),
+            description=(
+                f"Email analysis completed. "
+                f"Threat ID: {threat.id}; "
+                f"score={threat.risk_score}; "
+                f"severity={threat.severity}"
+            ),
+            status="SUCCESS",
+        )
+
+        response_data = {
+            "message": (
+                "Email analysis completed."
+            ),
+            "email_analysis_id": (
+                email_analysis.id
+            ),
+            "scan_id": scan.id,
+            "threat_id": threat.id,
+            "risk_score": threat.risk_score,
+            "severity": threat.severity,
+            "prediction": result.get(
+                "prediction",
+                "UNKNOWN",
+            ),
+            "confidence": _normalize_confidence(
+                result.get(
+                    "confidence",
+                    0,
+                )
+            ),
+            "indicators": result.get(
+                "indicators",
+                [],
+            ),
+            "entities": result.get(
+                "entities",
+                {},
+            ),
+            "recommendation": result.get(
+                "recommendation",
+                "",
+            ),
+            "explanation": threat.explanation,
+            "recommended_actions": risk.get(
+                "recommended_actions",
+                [],
+            ),
+        }
+
+        if incident:
+            response_data["incident"] = {
+                "id": incident.id,
+                "severity": incident.severity,
+                "status": incident.status,
+            }
+
+        return Response(
+            response_data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class PhishingHistoryView(
+    generics.ListAPIView
+):
+    serializer_class = PhishingScanSerializer
+    permission_classes = [
+        IsAuthenticated
+    ]
+
+    def get_queryset(self):
+        return PhishingScan.objects.filter(
+            user=self.request.user
+        ).order_by(
+            "-created_at"
+        )
+
+
+class PhishingDetailView(
+    generics.RetrieveAPIView
+):
+    serializer_class = PhishingScanSerializer
+    permission_classes = [
+        IsAuthenticated
+    ]
+
+    def get_queryset(self):
         return PhishingScan.objects.filter(
             user=self.request.user
         )
