@@ -735,7 +735,13 @@ class URLAnalysisView(APIView):
                     False,
                 )
             ),
-            redirect_count=0,
+            redirect_count=int(
+                features.get(
+                    "redirect_count",
+                    0,
+                )
+                or 0
+            ),
             analysis_details={
                 "url": url,
                 "prediction": result.get(

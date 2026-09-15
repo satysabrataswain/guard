@@ -1,16 +1,3 @@
-"""
-Phishing URL Detection Engine
-
-This module performs explainable, rule-based phishing risk analysis.
-
-Important:
-- This is a detection layer, not a guarantee of maliciousness.
-- HTTPS does NOT imply that a URL is safe.
-- URL shorteners are treated as a risk signal, not automatic phishing.
-- Reputation, DNS, redirect-chain and external threat-intelligence checks
-  can be added later without changing the public interface.
-"""
-
 from __future__ import annotations
 
 import ipaddress
@@ -19,6 +6,8 @@ import re
 from collections import Counter
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
+
+from .url_redirect import resolve_redirect_chain
 
 
 # ---------------------------------------------------------------------------
@@ -323,7 +312,11 @@ def _contains_dangerous_file(url_path: str) -> bool:
 # Main analysis
 # ---------------------------------------------------------------------------
 
-def analyze_url(url: str) -> dict[str, Any]:
+def analyze_url(
+    url: str,
+    *,
+    resolve_redirects: bool = True,
+) -> dict[str, Any]:
     """
     Analyze a URL for phishing indicators.
 
@@ -341,7 +334,9 @@ def analyze_url(url: str) -> dict[str, Any]:
         "recommendation": "...",
     }
 
-    No external network request is performed.
+    By default, HTTP/HTTPS redirect chains are inspected. Redirect targets
+    are validated before each request and private/local destinations are
+    blocked. Set resolve_redirects=False for offline-only analysis.
     """
 
     original_url = str(url).strip() if url is not None else ""
@@ -413,6 +408,61 @@ def analyze_url(url: str) -> dict[str, Any]:
         }
 
     # -----------------------------------------------------------------------
+    # Redirect / shortener inspection
+    # -----------------------------------------------------------------------
+
+    redirect_info: dict[str, Any] = {
+        "enabled": False,
+        "resolved": False,
+        "original_url": original_url,
+        "final_url": normalized_url,
+        "redirect_chain": [normalized_url],
+        "redirect_count": 0,
+        "status_codes": [],
+        "shortener_detected": False,
+        "error": "",
+    }
+
+    if resolve_redirects:
+        redirect_info = resolve_redirect_chain(normalized_url)
+
+    final_url = str(
+        redirect_info.get(
+            "final_url",
+            normalized_url,
+        )
+        or normalized_url
+    )
+
+    try:
+        final_parsed = urlparse(final_url)
+        final_hostname = (final_parsed.hostname or "").lower()
+    except ValueError:
+        final_parsed = parsed
+        final_hostname = hostname
+
+    redirect_count = int(
+        redirect_info.get(
+            "redirect_count",
+            0,
+        )
+        or 0
+    )
+
+    destination_result: dict[str, Any] = {}
+
+    if (
+        redirect_count > 0
+        and final_url
+        and final_url != normalized_url
+    ):
+        # Analyze the final destination without resolving it again.
+        destination_result = analyze_url(
+            final_url,
+            resolve_redirects=False,
+        )
+
+    # -----------------------------------------------------------------------
     # Feature extraction
     # -----------------------------------------------------------------------
 
@@ -426,7 +476,10 @@ def analyze_url(url: str) -> dict[str, Any]:
 
     is_https = parsed.scheme.lower() == "https"
     is_ip = _is_ip_address(hostname)
-    is_shortener = hostname in SHORTENER_DOMAINS
+    is_shortener = (
+        hostname in SHORTENER_DOMAINS
+        or hostname.removeprefix("www.") in SHORTENER_DOMAINS
+    )
 
     suspicious_keywords = _keyword_matches(full_lower)
     brand_indicators = _brand_impersonation(hostname)
@@ -523,10 +576,41 @@ def analyze_url(url: str) -> dict[str, Any]:
     if is_shortener:
         add_risk(
             12,
-            "URL uses a known URL-shortening service; final destination should be inspected.",
+            "URL uses a known URL-shortening service; final destination was inspected.",
         )
 
-    # 6. @ symbol
+    # 6. Redirect chain
+    if redirect_count == 1:
+        add_risk(
+            4,
+            "URL redirects to another destination.",
+        )
+    elif redirect_count >= 2:
+        add_risk(
+            min(14, 4 + ((redirect_count - 1) * 3)),
+            f"URL uses a redirect chain with {redirect_count} hop(s).",
+        )
+
+    if redirect_info.get("error"):
+        indicators.append(
+            "Redirect inspection could not be completed safely: "
+            + str(redirect_info["error"])
+        )
+
+    destination_score = _clamp_score(
+        destination_result.get(
+            "risk_score",
+            0,
+        )
+    ) if destination_result else 0.0
+
+    if destination_score >= 40:
+        add_risk(
+            min(30, round(destination_score * 0.40, 2)),
+            "Final redirect destination contains phishing-risk indicators.",
+        )
+
+    # 7. @ symbol
     if has_at_symbol:
         add_risk(
             18,
@@ -642,6 +726,22 @@ def analyze_url(url: str) -> dict[str, Any]:
             "URL shortener is combined with suspicious account/security language.",
         )
 
+    # A redirect from a shortener to a different registered domain is a useful
+    # contextual signal. It is not automatically malicious.
+    original_registered = _get_registered_domain(hostname)
+    final_registered = _get_registered_domain(final_hostname)
+
+    if (
+        redirect_count > 0
+        and original_registered
+        and final_registered
+        and original_registered != final_registered
+    ):
+        add_risk(
+            8,
+            "Redirect destination uses a different registered domain from the original URL.",
+        )
+
     score = _clamp_score(score)
 
     severity = _get_severity(score)
@@ -740,6 +840,34 @@ def analyze_url(url: str) -> dict[str, Any]:
                 has_port and parsed.port not in {80, 443}
             ),
             "dangerous_file_extension": dangerous_file,
+            "redirects_enabled": bool(resolve_redirects),
+            "redirect_resolved": bool(redirect_info.get("resolved", False)),
+            "redirect_count": redirect_count,
+            "redirect_chain": redirect_info.get("redirect_chain", []),
+            "redirect_status_codes": redirect_info.get("status_codes", []),
+            "redirect_error": redirect_info.get("error", ""),
+            "final_url": final_url,
+            "final_hostname": final_hostname,
+            "final_registered_domain": final_registered,
+            "redirect_destination_changed": bool(
+                redirect_count > 0
+                and original_registered
+                and final_registered
+                and original_registered != final_registered
+            ),
+            "destination_risk_score": destination_score,
+            "destination_severity": destination_result.get(
+                "severity",
+                "SAFE",
+            ) if destination_result else "SAFE",
+            "destination_prediction": destination_result.get(
+                "prediction",
+                "UNKNOWN",
+            ) if destination_result else "UNKNOWN",
+            "destination_indicators": destination_result.get(
+                "indicators",
+                [],
+            ) if destination_result else [],
         },
         "recommendation": recommendation,
     }
@@ -749,14 +877,21 @@ def analyze_url(url: str) -> dict[str, Any]:
 # Compatibility wrapper
 # ---------------------------------------------------------------------------
 
-def analyze_phishing_url(url: str) -> dict[str, Any]:
+def analyze_phishing_url(
+    url: str,
+    *,
+    resolve_redirects: bool = True,
+) -> dict[str, Any]:
     """
     Compatibility alias for the application layer.
 
     Use this if the Django phishing module wants a descriptive function name.
     """
 
-    return analyze_url(url)
+    return analyze_url(
+        url,
+        resolve_redirects=resolve_redirects,
+    )
 
 
 def predict(url: str) -> dict[str, Any]:

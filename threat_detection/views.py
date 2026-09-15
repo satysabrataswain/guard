@@ -10,8 +10,17 @@ from rest_framework.views import APIView
 from accounts.utils import get_client_ip
 from audit_logs.models import AuditLog
 
-from ai_engine.anomaly_model import analyze_behavior, analyze_login
-from ai_engine.nlp_model import analyze_email, analyze_message
+from ai_engine.anomaly_model import (
+    analyze_behavior,
+    analyze_login,
+)
+from ai_engine.correlation_engine import (
+    correlate_threat_signals,
+)
+from ai_engine.nlp_model import (
+    analyze_email,
+    analyze_message,
+)
 from ai_engine.phishing_model import analyze_url
 from ai_engine.risk_engine import analyze_risk
 
@@ -21,7 +30,11 @@ from incidents.models import (
     ResponseAction,
 )
 
-from .models import Threat, ThreatAnalysis, ThreatEvidence
+from .models import (
+    Threat,
+    ThreatAnalysis,
+    ThreatEvidence,
+)
 from .serializers import ThreatSerializer
 
 
@@ -34,6 +47,7 @@ def _stringify_input(value: Any) -> str:
     """
     Convert API input into a safe string for Threat.input_data.
     """
+
     if isinstance(value, str):
         return value
 
@@ -51,6 +65,7 @@ def _as_dict(value: Any) -> dict:
     """
     Convert input into a dictionary when possible.
     """
+
     if isinstance(value, dict):
         return value
 
@@ -61,7 +76,11 @@ def _as_dict(value: Any) -> dict:
             if isinstance(parsed, dict):
                 return parsed
 
-        except (TypeError, ValueError, json.JSONDecodeError):
+        except (
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+        ):
             pass
 
     return {}
@@ -74,6 +93,7 @@ def _safe_float(
     """
     Normalize any score to 0-100.
     """
+
     try:
         number = float(value)
 
@@ -92,7 +112,9 @@ def _safe_float(
     )
 
 
-def _normalize_confidence(value: Any) -> float:
+def _normalize_confidence(
+    value: Any,
+) -> float:
     """
     Normalize confidence.
 
@@ -100,6 +122,7 @@ def _normalize_confidence(value: Any) -> float:
         0.0 - 1.0  -> converted to percentage
         0 - 100    -> kept as percentage
     """
+
     try:
         confidence = float(value)
 
@@ -127,16 +150,26 @@ def _unique_indicators(
     """
     Collect unique indicators from all detection engines.
     """
+
     indicators = []
 
     for _, result in model_results:
 
-        if not isinstance(result, dict):
+        if not isinstance(
+            result,
+            dict,
+        ):
             continue
 
-        values = result.get("indicators", [])
+        values = result.get(
+            "indicators",
+            [],
+        )
 
-        if not isinstance(values, list):
+        if not isinstance(
+            values,
+            list,
+        ):
             continue
 
         for indicator in values:
@@ -144,7 +177,9 @@ def _unique_indicators(
             if indicator is None:
                 continue
 
-            text = str(indicator).strip()
+            text = str(
+                indicator
+            ).strip()
 
             if not text:
                 continue
@@ -153,6 +188,217 @@ def _unique_indicators(
                 indicators.append(text)
 
     return indicators
+
+
+# ============================================================================
+# CORRELATION HELPERS
+# ============================================================================
+
+
+def _build_correlation_signals(
+    model_results: list[tuple[str, dict]],
+    request_data: Any = None,
+) -> list[dict]:
+    """
+    Convert detection-engine results and optional API-provided
+    signals into the unified correlation-engine format.
+
+    The original single-source detection flow remains unchanged.
+    Correlation is additive and is only applied when multiple
+    distinct sources are available.
+    """
+
+    signals = []
+
+    engine_source_map = {
+        "URL_PHISHING_ENGINE": "URL",
+        "EMAIL_NLP_ENGINE": "EMAIL",
+        "MESSAGE_NLP_ENGINE": "MESSAGE",
+        "LOGIN_ANOMALY_ENGINE": "LOGIN",
+        "BEHAVIOUR_ANOMALY_ENGINE": "DEVICE",
+        "NETWORK_ENGINE": "NETWORK",
+        "IMAGE_ENGINE": "IMAGE",
+        "VIDEO_ENGINE": "VIDEO",
+        "DEEPFAKE_ENGINE": "VIDEO",
+        "IDENTITY_ENGINE": "IDENTITY",
+        "MALWARE_ENGINE": "FILE",
+    }
+
+    # ------------------------------------------------------------------
+    # Detection engine results
+    # ------------------------------------------------------------------
+
+    for model_name, result in model_results:
+
+        if not isinstance(
+            result,
+            dict,
+        ):
+            continue
+
+        score = _safe_float(
+            result.get(
+                "risk_score",
+                result.get(
+                    "score",
+                    0,
+                ),
+            )
+        )
+
+        source = engine_source_map.get(
+            model_name,
+            model_name.replace(
+                "_ENGINE",
+                "",
+            ),
+        )
+
+        indicators = result.get(
+            "indicators",
+            [],
+        )
+
+        if not isinstance(
+            indicators,
+            list,
+        ):
+            indicators = []
+
+        signals.append(
+            {
+                "source": source,
+                "score": score,
+                "indicators": [
+                    str(item)
+                    for item in indicators
+                    if item is not None
+                    and str(item).strip()
+                ],
+            }
+        )
+
+    # ------------------------------------------------------------------
+    # Optional externally supplied correlation signals
+    #
+    # Accepted formats:
+    #
+    # {
+    #     "correlation_signals": [...]
+    # }
+    #
+    # OR directly:
+    #
+    # [...]
+    # ------------------------------------------------------------------
+
+    if isinstance(
+        request_data,
+        list,
+    ):
+        external_signals = request_data
+
+    elif isinstance(
+        request_data,
+        dict,
+    ):
+        external_signals = request_data.get(
+            "correlation_signals",
+            [],
+        )
+
+    else:
+        external_signals = []
+
+    if not isinstance(
+        external_signals,
+        list,
+    ):
+        external_signals = []
+
+    for signal in external_signals:
+
+        if not isinstance(
+            signal,
+            dict,
+        ):
+            continue
+
+        source = signal.get(
+            "source"
+        )
+
+        if not source:
+            continue
+
+        score = _safe_float(
+            signal.get(
+                "score",
+                signal.get(
+                    "risk_score",
+                    0,
+                ),
+            )
+        )
+
+        indicators = signal.get(
+            "indicators",
+            [],
+        )
+
+        if not isinstance(
+            indicators,
+            list,
+        ):
+            indicators = []
+
+        signals.append(
+            {
+                "source": str(
+                    source
+                ).upper(),
+                "score": score,
+                "indicators": [
+                    str(item)
+                    for item in indicators
+                    if item is not None
+                    and str(item).strip()
+                ],
+            }
+        )
+
+    return signals
+
+
+def _get_distinct_correlation_sources(
+    signals: list[dict],
+) -> set[str]:
+    """
+    Return unique normalized source names.
+    """
+
+    sources = set()
+
+    for signal in signals:
+
+        if not isinstance(
+            signal,
+            dict,
+        ):
+            continue
+
+        source = signal.get(
+            "source"
+        )
+
+        if not source:
+            continue
+
+        sources.add(
+            str(source).upper().strip()
+        )
+
+    return sources
 
 
 # ============================================================================
@@ -170,13 +416,19 @@ def _save_model_result(
     and its indicators into ThreatEvidence.
     """
 
-    if not isinstance(result, dict):
+    if not isinstance(
+        result,
+        dict,
+    ):
         result = {}
 
     score = _safe_float(
         result.get(
             "risk_score",
-            result.get("score", 0),
+            result.get(
+                "score",
+                0,
+            ),
         )
     )
 
@@ -209,7 +461,10 @@ def _save_model_result(
         [],
     )
 
-    if not isinstance(indicators, list):
+    if not isinstance(
+        indicators,
+        list,
+    ):
         return
 
     evidence_objects = []
@@ -219,7 +474,9 @@ def _save_model_result(
         if indicator is None:
             continue
 
-        indicator_text = str(indicator).strip()
+        indicator_text = str(
+            indicator
+        ).strip()
 
         if not indicator_text:
             continue
@@ -234,6 +491,7 @@ def _save_model_result(
         )
 
     if evidence_objects:
+
         ThreatEvidence.objects.bulk_create(
             evidence_objects
         )
@@ -531,6 +789,7 @@ def _create_incident(
         )
 
     if incident_evidence:
+
         IncidentEvidence.objects.bulk_create(
             incident_evidence
         )
@@ -584,6 +843,7 @@ class ThreatListCreateView(
     generics.ListCreateAPIView
 ):
     serializer_class = ThreatSerializer
+
     permission_classes = [
         IsAuthenticated
     ]
@@ -632,6 +892,7 @@ class ThreatDetailView(
     generics.RetrieveUpdateAPIView
 ):
     serializer_class = ThreatSerializer
+
     permission_classes = [
         IsAuthenticated
     ]
@@ -793,6 +1054,42 @@ class ThreatAnalyzeView(
         )
 
         # ------------------------------------------------------------------
+        # 4A. Unified multi-source correlation
+        # ------------------------------------------------------------------
+
+        correlation_signals = (
+            _build_correlation_signals(
+                model_results=model_results,
+                request_data=request.data,
+            )
+        )
+
+        correlation_result = None
+
+        distinct_sources = (
+            _get_distinct_correlation_sources(
+                correlation_signals
+            )
+        )
+
+        # Correlation is enabled only when at least
+        # two distinct threat sources are available.
+        if len(distinct_sources) >= 2:
+
+            try:
+
+                correlation_result = (
+                    correlate_threat_signals(
+                        correlation_signals
+                    )
+                )
+
+            except Exception:
+                # Never break the original threat-analysis
+                # API merely because correlation fails.
+                correlation_result = None
+
+        # ------------------------------------------------------------------
         # 5. Prepare scores for central risk engine
         # ------------------------------------------------------------------
 
@@ -866,12 +1163,122 @@ class ThreatAnalyzeView(
             recommended_actions = []
 
         # ------------------------------------------------------------------
+        # 6A. Apply unified correlation score
+        #
+        # We keep the original risk engine intact for compatibility.
+        # If correlation produces a valid unified score, it becomes the
+        # final multi-source risk score.
+        # ------------------------------------------------------------------
+
+        if isinstance(
+            correlation_result,
+            dict,
+        ):
+
+            correlated_score = correlation_result.get(
+                "risk_score",
+                correlation_result.get(
+                    "unified_risk_score",
+                    correlation_result.get(
+                        "score",
+                        None,
+                    ),
+                ),
+            )
+
+            if correlated_score is not None:
+
+                correlation_score = _safe_float(
+                    correlated_score
+                )
+
+                # Use the correlation score as the final
+                # score only when multiple sources exist.
+                risk_score = correlation_score
+
+                correlated_severity = correlation_result.get(
+                    "severity"
+                )
+
+                if correlated_severity:
+
+                    correlated_severity = str(
+                        correlated_severity
+                    ).upper()
+
+                    if correlated_severity in dict(
+                        Threat.SEVERITY_CHOICES
+                    ):
+                        severity = correlated_severity
+
+                correlation_explanation = (
+                    correlation_result.get(
+                        "explanation"
+                    )
+                )
+
+                if correlation_explanation:
+
+                    correlation_explanation = str(
+                        correlation_explanation
+                    )
+
+                    if explanation:
+
+                        explanation = (
+                            f"{explanation} "
+                            f"Correlation analysis: "
+                            f"{correlation_explanation}"
+                        )
+
+                    else:
+
+                        explanation = (
+                            f"Correlation analysis: "
+                            f"{correlation_explanation}"
+                        )
+
+        # ------------------------------------------------------------------
         # 7. Add detailed indicators
         # ------------------------------------------------------------------
 
         indicators = _unique_indicators(
             model_results
         )
+
+        # Also collect indicators from correlation result.
+        if isinstance(
+            correlation_result,
+            dict,
+        ):
+
+            correlation_indicators = (
+                correlation_result.get(
+                    "indicators",
+                    [],
+                )
+            )
+
+            if not isinstance(
+                correlation_indicators,
+                list,
+            ):
+                correlation_indicators = []
+
+            for indicator in correlation_indicators:
+
+                if indicator is None:
+                    continue
+
+                text = str(
+                    indicator
+                ).strip()
+
+                if not text:
+                    continue
+
+                if text not in indicators:
+                    indicators.append(text)
 
         if indicators:
 
@@ -880,12 +1287,15 @@ class ThreatAnalyzeView(
             )
 
             if explanation:
+
                 explanation = (
                     f"{explanation} "
                     f"Key indicators: "
                     f"{indicator_text}"
                 )
+
             else:
+
                 explanation = (
                     "Security indicators detected: "
                     f"{indicator_text}"
@@ -919,6 +1329,93 @@ class ThreatAnalyzeView(
                 model_name=model_name,
                 result=result,
             )
+
+        # ------------------------------------------------------------------
+        # 9A. Save correlation evidence
+        # ------------------------------------------------------------------
+
+        if isinstance(
+            correlation_result,
+            dict,
+        ):
+
+            correlation_evidence = (
+                correlation_result.get(
+                    "evidence",
+                    [],
+                )
+            )
+
+            if not isinstance(
+                correlation_evidence,
+                list,
+            ):
+                correlation_evidence = []
+
+            evidence_objects = []
+
+            for evidence in correlation_evidence:
+
+                if isinstance(
+                    evidence,
+                    dict,
+                ):
+
+                    evidence_value = evidence.get(
+                        "evidence",
+                        evidence.get(
+                            "value",
+                            evidence.get(
+                                "description",
+                                "",
+                            ),
+                        ),
+                    )
+
+                    evidence_type = evidence.get(
+                        "type",
+                        "CORRELATION",
+                    )
+
+                    contribution = evidence.get(
+                        "risk_contribution",
+                        risk_score,
+                    )
+
+                else:
+
+                    evidence_value = evidence
+                    evidence_type = "CORRELATION"
+                    contribution = risk_score
+
+                if evidence_value is None:
+                    continue
+
+                evidence_text = str(
+                    evidence_value
+                ).strip()
+
+                if not evidence_text:
+                    continue
+
+                evidence_objects.append(
+                    ThreatEvidence(
+                        threat=threat,
+                        evidence_type=str(
+                            evidence_type
+                        )[:100],
+                        evidence_value=evidence_text,
+                        risk_contribution=_safe_float(
+                            contribution
+                        ),
+                    )
+                )
+
+            if evidence_objects:
+
+                ThreatEvidence.objects.bulk_create(
+                    evidence_objects
+                )
 
         # ------------------------------------------------------------------
         # 10. No dedicated engine
@@ -958,6 +1455,10 @@ class ThreatAnalyzeView(
         # 12. Audit log
         # ------------------------------------------------------------------
 
+        correlation_enabled = (
+            correlation_result is not None
+        )
+
         AuditLog.objects.create(
             user=request.user,
             action="THREAT_ANALYZED",
@@ -973,7 +1474,8 @@ class ThreatAnalyzeView(
                 f"Threat ID: {threat.id}; "
                 f"score={risk_score}; "
                 f"severity={severity}; "
-                f"engines={len(model_results)}"
+                f"engines={len(model_results)}; "
+                f"correlation={correlation_enabled}"
             ),
             status="SUCCESS",
         )
@@ -981,6 +1483,26 @@ class ThreatAnalyzeView(
         # ------------------------------------------------------------------
         # 13. Build response
         # ------------------------------------------------------------------
+
+        if correlation_result is not None:
+
+            correlation_response = (
+                correlation_result
+            )
+
+        else:
+
+            correlation_response = {
+                "enabled": False,
+                "reason": (
+                    "Correlation requires "
+                    "at least two distinct "
+                    "threat sources."
+                ),
+                "sources": sorted(
+                    distinct_sources
+                ),
+            }
 
         response_data = {
             "message": (
@@ -1004,6 +1526,7 @@ class ThreatAnalyzeView(
                     indicators
                 ),
                 "indicators": indicators,
+                "correlation": correlation_response,
             },
         }
 
@@ -1030,6 +1553,7 @@ class ThreatDeleteView(
     generics.DestroyAPIView
 ):
     serializer_class = ThreatSerializer
+
     permission_classes = [
         IsAuthenticated
     ]
