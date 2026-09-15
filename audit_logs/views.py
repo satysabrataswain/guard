@@ -1,26 +1,40 @@
-
 from __future__ import annotations
 
 from django.db.models import Q
 
 from rest_framework import generics
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import BasePermission, IsAuthenticated
 
 from .models import AuditLog
 from .serializers import AuditLogSerializer
 
 
+class IsAuditAdmin(BasePermission):
+    """
+    Only staff users or users with the admin role can access
+    the admin audit-log endpoint.
+    """
+
+    message = "Admin access required."
+
+    def has_permission(self, request, view):
+        user = request.user
+
+        if not user or not user.is_authenticated:
+            return False
+
+        return bool(
+            getattr(user, "is_staff", False)
+            or getattr(user, "role", "user") == "admin"
+        )
+
+
 class AuditLogListView(generics.ListAPIView):
     """
-    Return audit logs visible to the current user.
+    General audit-log endpoint.
 
-    Normal users:
-        Only their own audit events.
-
-    Analysts/Admins:
-        Can review the broader audit trail.
-
-    The queryset is read-only through this API.
+    Admins and analysts can view all audit logs.
+    Normal users can view only their own logs.
     """
 
     serializer_class = AuditLogSerializer
@@ -32,13 +46,10 @@ class AuditLogListView(generics.ListAPIView):
         queryset = AuditLog.objects.select_related(
             "user"
         ).order_by(
-            "-timestamp"
+            "-created_at"
         )
 
-        # ----------------------------------------------------
-        # Normal users only see their own audit records.
-        # ----------------------------------------------------
-
+        # Normal users can only see their own audit logs.
         if not getattr(user, "is_staff", False) and getattr(
             user,
             "role",
@@ -51,33 +62,12 @@ class AuditLogListView(generics.ListAPIView):
                 user=user
             )
 
-        # ----------------------------------------------------
-        # Optional filters
-        # ----------------------------------------------------
-
-        action = self.request.query_params.get(
-            "action"
-        )
-
-        status_value = self.request.query_params.get(
-            "status"
-        )
-
-        resource = self.request.query_params.get(
-            "resource"
-        )
-
-        resource_id = self.request.query_params.get(
-            "resource_id"
-        )
-
-        user_id = self.request.query_params.get(
-            "user_id"
-        )
-
-        search = self.request.query_params.get(
-            "search"
-        )
+        action = self.request.query_params.get("action")
+        status_value = self.request.query_params.get("status")
+        resource = self.request.query_params.get("resource")
+        resource_id = self.request.query_params.get("resource_id")
+        user_id = self.request.query_params.get("user_id")
+        search = self.request.query_params.get("search")
 
         if action:
             queryset = queryset.filter(
@@ -99,19 +89,11 @@ class AuditLogListView(generics.ListAPIView):
                 resource_id=str(resource_id).strip()
             )
 
-        # ----------------------------------------------------
-        # user_id filter is restricted to privileged users.
-        # ----------------------------------------------------
-
         if user_id:
-
             is_privileged = (
                 getattr(user, "is_staff", False)
                 or getattr(user, "role", "user")
-                in {
-                    "analyst",
-                    "admin",
-                }
+                in {"analyst", "admin"}
             )
 
             if is_privileged:
@@ -119,23 +101,14 @@ class AuditLogListView(generics.ListAPIView):
                     user__user_id=user_id.strip()
                 )
             else:
-                # A normal user must never be able to use
-                # user_id filtering to inspect another user's
-                # audit history.
                 queryset = queryset.filter(
                     user=user
                 )
 
-        # ----------------------------------------------------
-        # General search
-        # ----------------------------------------------------
-
         if search:
-
             search = search.strip()
 
             if search:
-
                 queryset = queryset.filter(
                     Q(action__icontains=search)
                     | Q(description__icontains=search)
@@ -149,17 +122,16 @@ class AuditLogListView(generics.ListAPIView):
 
 class AuditLogDetailView(generics.RetrieveAPIView):
     """
-    Return a single audit record.
+    View a single audit log.
 
-    Access is restricted so a normal user can only inspect
-    their own audit events.
+    Staff/admin/analyst users can view any log.
+    Normal users can view only their own logs.
     """
 
     serializer_class = AuditLogSerializer
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-
         user = self.request.user
 
         queryset = AuditLog.objects.select_related(
@@ -182,21 +154,80 @@ class AuditLogDetailView(generics.RetrieveAPIView):
 
 class MyAuditLogListView(generics.ListAPIView):
     """
-    Explicit endpoint for the current user's audit history.
-
-    This endpoint intentionally ignores arbitrary user_id
-    query parameters.
+    Return only the currently authenticated user's audit logs.
     """
 
     serializer_class = AuditLogSerializer
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
+        return (
+            AuditLog.objects
+            .filter(user=self.request.user)
+            .select_related("user")
+            .order_by("-created_at")
+        )
 
-        return AuditLog.objects.filter(
-            user=self.request.user
-        ).select_related(
+
+class AdminAuditLogListView(generics.ListAPIView):
+    """
+    Admin-only audit-log endpoint.
+
+    Normal users and analysts are not allowed here.
+    """
+
+    serializer_class = AuditLogSerializer
+    permission_classes = [IsAuditAdmin]
+
+    def get_queryset(self):
+        queryset = AuditLog.objects.select_related(
             "user"
         ).order_by(
-            "-timestamp"
+            "-created_at"
         )
+
+        action = self.request.query_params.get("action")
+        status_value = self.request.query_params.get("status")
+        resource = self.request.query_params.get("resource")
+        resource_id = self.request.query_params.get("resource_id")
+        user_id = self.request.query_params.get("user_id")
+        search = self.request.query_params.get("search")
+
+        if action:
+            queryset = queryset.filter(
+                action__iexact=action.strip()
+            )
+
+        if status_value:
+            queryset = queryset.filter(
+                status__iexact=status_value.strip()
+            )
+
+        if resource:
+            queryset = queryset.filter(
+                resource__iexact=resource.strip()
+            )
+
+        if resource_id:
+            queryset = queryset.filter(
+                resource_id=str(resource_id).strip()
+            )
+
+        if user_id:
+            queryset = queryset.filter(
+                user__user_id=user_id.strip()
+            )
+
+        if search:
+            search = search.strip()
+
+            if search:
+                queryset = queryset.filter(
+                    Q(action__icontains=search)
+                    | Q(description__icontains=search)
+                    | Q(resource__icontains=search)
+                    | Q(resource_id__icontains=search)
+                    | Q(ip_address__icontains=search)
+                )
+
+        return queryset

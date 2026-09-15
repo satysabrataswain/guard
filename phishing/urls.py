@@ -1,31 +1,30 @@
 from django.urls import path
 
 from .views import (
-    PhishingScanListView,
+    PhishingScanListCreateView,
     PhishingScanDetailView,
-    URLAnalyzeView,
-    EmailAnalyzeView,
     PhishingScanDeleteView,
+    URLAnalysisView,
+    EmailAnalysisView,
 )
 
 
 urlpatterns = [
-
     path(
         "url/analyze/",
-        URLAnalyzeView.as_view(),
+        URLAnalysisView.as_view(),
         name="url-analyze",
     ),
 
     path(
         "email/analyze/",
-        EmailAnalyzeView.as_view(),
+        EmailAnalysisView.as_view(),
         name="email-analyze",
     ),
 
     path(
         "history/",
-        PhishingScanListView.as_view(),
+        PhishingScanListCreateView.as_view(),
         name="phishing-history",
     ),
 

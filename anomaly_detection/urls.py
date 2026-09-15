@@ -1,28 +1,29 @@
 from django.urls import path
 
 from .views import (
-    AnalyseLoginView,
-    BehaviourCreateView,
+    LoginAnalysisView,
+    BehaviourAnalysisView,
     LoginActivityCreateView,
+    LoginActivityHistoryView,
+    LoginActivityDetailView,
+    BehaviourHistoryView,
+    BehaviourDetailView,
     AnomalyHistoryView,
     AnomalyDetailView,
-    BehaviourHistoryView,
-    LoginHistoryView,
 )
 
 
 urlpatterns = [
-
     path(
         "login/analyze/",
-        AnalyseLoginView.as_view(),
+        LoginAnalysisView.as_view(),
         name="login-analyze",
     ),
 
     path(
         "behavior/",
-        BehaviourCreateView.as_view(),
-        name="behavior-create",
+        BehaviourAnalysisView.as_view(),
+        name="behavior-analyze",
     ),
 
     path(
@@ -44,9 +45,21 @@ urlpatterns = [
     ),
 
     path(
+        "behavior/<int:pk>/",
+        BehaviourDetailView.as_view(),
+        name="behavior-detail",
+    ),
+
+    path(
         "login/history/",
-        LoginHistoryView.as_view(),
+        LoginActivityHistoryView.as_view(),
         name="login-history",
+    ),
+
+    path(
+        "login/activity/<int:pk>/",
+        LoginActivityDetailView.as_view(),
+        name="login-activity-detail",
     ),
 
     path(

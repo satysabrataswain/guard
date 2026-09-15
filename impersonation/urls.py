@@ -3,14 +3,13 @@ from django.urls import path
 from .views import (
     ImpersonationHistoryView,
     ImpersonationDetailView,
+    ImpersonationDeleteView,
     ImageAnalyzeView,
     VideoAnalyzeView,
-    ImpersonationDeleteView,
 )
 
 
 urlpatterns = [
-
     path(
         "image/analyze/",
         ImageAnalyzeView.as_view(),

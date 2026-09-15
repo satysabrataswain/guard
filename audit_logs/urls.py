@@ -1,22 +1,39 @@
-
 from django.urls import path
 
 from .views import (
-    AuditLogDetailView,
     AuditLogListView,
+    AuditLogDetailView,
     MyAuditLogListView,
+    AdminAuditLogListView,
 )
 
+
 urlpatterns = [
-    path("",AuditLogListView.as_view(),name="audit-log-list", ),
+    # General audit logs
     path(
-        "mine/",
-        MyAuditLogListView.as_view(),
-        name="my-audit-log-list",
+        "",
+        AuditLogListView.as_view(),
+        name="audit-list",
     ),
+
+    # Admin-only audit logs
+    path(
+        "admin/",
+        AdminAuditLogListView.as_view(),
+        name="audit-admin",
+    ),
+
+    # Current user's own audit logs
+    path(
+        "my/",
+        MyAuditLogListView.as_view(),
+        name="audit-my",
+    ),
+
+    # Individual audit log
     path(
         "<int:pk>/",
         AuditLogDetailView.as_view(),
-        name="audit-log-detail",
+        name="audit-detail",
     ),
 ]

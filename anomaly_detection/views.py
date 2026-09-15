@@ -42,16 +42,17 @@ from .serializers import (
 )
 
 
+# ============================================================
+# HELPERS
+# ============================================================
+
 def _safe_float(
     value: Any,
     default: float = 0.0,
 ) -> float:
     try:
         number = float(value)
-    except (
-        TypeError,
-        ValueError,
-    ):
+    except (TypeError, ValueError):
         return default
 
     return round(
@@ -71,12 +72,10 @@ def _normalize_confidence(
 ) -> float:
     try:
         confidence = float(value)
-    except (
-        TypeError,
-        ValueError,
-    ):
+    except (TypeError, ValueError):
         return 0.0
 
+    # Convert 0-1 confidence into 0-100.
     if 0.0 <= confidence <= 1.0:
         confidence *= 100.0
 
@@ -95,22 +94,13 @@ def _normalize_confidence(
 def _bool_value(
     value: Any,
 ) -> bool:
-    if isinstance(
-        value,
-        bool,
-    ):
+    if isinstance(value, bool):
         return value
 
-    if isinstance(
-        value,
-        (int, float),
-    ):
+    if isinstance(value, (int, float)):
         return bool(value)
 
-    if isinstance(
-        value,
-        str,
-    ):
+    if isinstance(value, str):
         return value.strip().lower() in {
             "1",
             "true",
@@ -121,6 +111,10 @@ def _bool_value(
 
     return False
 
+
+# ============================================================
+# THREAT CREATION
+# ============================================================
 
 def _create_threat(
     user,
@@ -171,13 +165,8 @@ def _create_threat(
             indicator
         ).strip()
 
-        if (
-            text
-            and text not in clean_indicators
-        ):
-            clean_indicators.append(
-                text
-            )
+        if text and text not in clean_indicators:
+            clean_indicators.append(text)
 
     explanation = str(
         risk.get(
@@ -206,9 +195,7 @@ def _create_threat(
         user=user,
         threat_type="ANOMALY",
         source_type=source_type,
-        input_data=str(
-            input_data
-        ),
+        input_data=str(input_data),
         risk_score=score,
         severity=severity,
         status="DETECTED",
@@ -300,10 +287,15 @@ def _save_threat_analysis(
         )
 
 
+# ============================================================
+# INCIDENT CREATION
+# ============================================================
+
 def _create_incident(
     threat: Threat,
     risk: dict,
 ) -> Incident | None:
+
     if threat.severity not in {
         "HIGH",
         "CRITICAL",
@@ -361,9 +353,7 @@ def _create_incident(
         recommended_actions = []
 
     for action in recommended_actions:
-        action_type = action_mapping.get(
-            action
-        )
+        action_type = action_mapping.get(action)
 
         if not action_type:
             continue
@@ -380,6 +370,10 @@ def _create_incident(
     return incident
 
 
+# ============================================================
+# LOGIN ANALYSIS
+# ============================================================
+
 class LoginAnalysisView(APIView):
     permission_classes = [
         IsAuthenticated
@@ -392,60 +386,132 @@ class LoginAnalysisView(APIView):
     ):
         data = request.data
 
-        failed_attempts = data.get(
-            "failed_attempts",
-            0,
+        # ----------------------------------------------------
+        # Historical login information
+        # ----------------------------------------------------
+
+        previous_logins = (
+            LoginActivity.objects
+            .filter(
+                user=request.user
+            )
+            .order_by("-created_at")
         )
 
-        try:
-            failed_attempts = int(
-                failed_attempts
+        recent_failed_attempts = (
+            previous_logins
+            .filter(
+                status="FAILED"
             )
-        except (
-            TypeError,
-            ValueError,
-        ):
-            return Response(
-                {
-                    "detail": (
-                        "failed_attempts "
-                        "must be an integer."
-                    )
-                },
-                status=status.HTTP_400_BAD_REQUEST,
+            .count()
+        )
+
+        latest_login = previous_logins.first()
+
+        # ----------------------------------------------------
+        # failed_attempts
+        # ----------------------------------------------------
+
+        if "failed_attempts" in data:
+            failed_attempts = data.get(
+                "failed_attempts"
             )
 
-        if failed_attempts < 0:
-            return Response(
-                {
-                    "detail": (
-                        "failed_attempts "
-                        "cannot be negative."
-                    )
-                },
-                status=status.HTTP_400_BAD_REQUEST,
+            try:
+                failed_attempts = int(
+                    failed_attempts
+                )
+            except (
+                TypeError,
+                ValueError,
+            ):
+                return Response(
+                    {
+                        "detail": (
+                            "failed_attempts "
+                            "must be an integer."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            if failed_attempts < 0:
+                return Response(
+                    {
+                        "detail": (
+                            "failed_attempts "
+                            "cannot be negative."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        else:
+            failed_attempts = recent_failed_attempts
+
+        # ----------------------------------------------------
+        # Current request values
+        # ----------------------------------------------------
+
+        current_ip = (
+            data.get("ip_address")
+            or get_client_ip(request)
+        )
+
+        current_device = (
+            data.get("device_id")
+            or ""
+        )
+
+        current_location = (
+            data.get("location")
+            or ""
+        )
+
+        # ----------------------------------------------------
+        # Infer new IP/device/location from history
+        # ----------------------------------------------------
+
+        if "new_ip" in data:
+            new_ip = _bool_value(
+                data.get("new_ip")
+            )
+        else:
+            new_ip = bool(
+                latest_login
+                and current_ip
+                and latest_login.ip_address
+                and current_ip != latest_login.ip_address
+            )
+
+        if "new_device" in data:
+            new_device = _bool_value(
+                data.get("new_device")
+            )
+        else:
+            new_device = bool(
+                latest_login
+                and current_device
+                and latest_login.device_id
+                and current_device != latest_login.device_id
+            )
+
+        if "new_location" in data:
+            new_location = _bool_value(
+                data.get("new_location")
+            )
+        else:
+            new_location = bool(
+                latest_login
+                and current_location
+                and latest_login.location
+                and current_location != latest_login.location
             )
 
         analysis_input = {
             "failed_attempts": failed_attempts,
-            "new_ip": _bool_value(
-                data.get(
-                    "new_ip",
-                    False,
-                )
-            ),
-            "new_device": _bool_value(
-                data.get(
-                    "new_device",
-                    False,
-                )
-            ),
-            "new_location": _bool_value(
-                data.get(
-                    "new_location",
-                    False,
-                )
-            ),
+            "new_ip": new_ip,
+            "new_device": new_device,
+            "new_location": new_location,
             "unusual_time": _bool_value(
                 data.get(
                     "unusual_time",
@@ -465,6 +531,10 @@ class LoginAnalysisView(APIView):
                 )
             ),
         }
+
+        # ----------------------------------------------------
+        # AI / anomaly engine
+        # ----------------------------------------------------
 
         result = analyze_login(
             **analysis_input
@@ -493,6 +563,10 @@ class LoginAnalysisView(APIView):
             }
         )
 
+        # ----------------------------------------------------
+        # Threat
+        # ----------------------------------------------------
+
         threat = _create_threat(
             user=request.user,
             source_type="LOGIN",
@@ -507,72 +581,96 @@ class LoginAnalysisView(APIView):
             result=result,
         )
 
+        # ----------------------------------------------------
+        # Recalculate incident after complete analysis
+        # ----------------------------------------------------
+
         incident = _create_incident(
             threat=threat,
             risk=risk,
         )
 
+        # ----------------------------------------------------
+        # Login activity
+        # ----------------------------------------------------
+
+        status_value = str(
+            data.get(
+                "status",
+                "",
+            )
+        ).strip().upper()
+
+        if status_value not in {
+            "SUCCESS",
+            "FAILED",
+            "BLOCKED",
+        }:
+            successful = _bool_value(
+                data.get(
+                    "successful",
+                    True,
+                )
+            )
+
+            status_value = (
+                "SUCCESS"
+                if successful
+                else "FAILED"
+            )
+
+        failure_reason = str(
+            data.get(
+                "failure_reason",
+                "",
+            )
+        )
+
+        if (
+            status_value in {
+                "FAILED",
+                "BLOCKED",
+            }
+            and not failure_reason
+        ):
+            failure_reason = "Anomaly analysis request"
+
         login_activity = LoginActivity.objects.create(
             user=request.user,
-            ip_address=data.get(
-                "ip_address"
-            )
-            or get_client_ip(request),
-            user_agent=data.get(
-                "user_agent"
-            )
-            or request.META.get(
-                "HTTP_USER_AGENT",
-                "",
+            ip_address=current_ip,
+            user_agent=(
+                data.get("user_agent")
+                or request.META.get(
+                    "HTTP_USER_AGENT",
+                    "",
+                )
             ),
-            device_id=data.get(
-                "device_id",
-                "",
-            ),
-            location=data.get(
-                "location",
-                "",
-            ),
-            successful=data.get(
-                "successful",
-                True,
-            ),
-            failed_attempts=failed_attempts,
-            is_new_ip=analysis_input[
-                "new_ip"
-            ],
-            is_new_device=analysis_input[
-                "new_device"
-            ],
-            is_new_location=analysis_input[
-                "new_location"
-            ],
-            unusual_time=analysis_input[
-                "unusual_time"
-            ],
-            impossible_travel=analysis_input[
-                "impossible_travel"
-            ],
-            suspicious_network=analysis_input[
-                "suspicious_network"
-            ],
+            location=current_location,
+            device_id=current_device,
+            status=status_value,
+            failure_reason=failure_reason,
         )
+
+        # ----------------------------------------------------
+        # Anomaly record
+        # ----------------------------------------------------
 
         anomaly = Anomaly.objects.create(
             user=request.user,
             anomaly_type="LOGIN",
             risk_score=threat.risk_score,
             severity=threat.severity,
-            description=threat.explanation,
-            detection_result=result,
+            explanation=threat.explanation,
         )
+
+        # ----------------------------------------------------
+        # Audit
+        # ----------------------------------------------------
 
         AuditLog.objects.create(
             user=request.user,
             action="LOGIN_ANOMALY_ANALYZED",
-            ip_address=get_client_ip(
-                request
-            ),
+            ip_address=get_client_ip(request),
             user_agent=request.META.get(
                 "HTTP_USER_AGENT",
                 "",
@@ -586,6 +684,10 @@ class LoginAnalysisView(APIView):
             status="SUCCESS",
         )
 
+        # ----------------------------------------------------
+        # Response
+        # ----------------------------------------------------
+
         response_data = {
             "message": (
                 "Login anomaly analysis completed."
@@ -594,6 +696,14 @@ class LoginAnalysisView(APIView):
                 login_activity.id
             ),
             "anomaly_id": anomaly.id,
+            "anomaly": {
+                "id": anomaly.id,
+                "type": anomaly.anomaly_type,
+                "risk_score": anomaly.risk_score,
+                "severity": anomaly.severity,
+                "status": anomaly.status,
+                "explanation": anomaly.explanation,
+            },
             "threat_id": threat.id,
             "risk_score": threat.risk_score,
             "severity": threat.severity,
@@ -630,6 +740,10 @@ class LoginAnalysisView(APIView):
             status=status.HTTP_201_CREATED,
         )
 
+
+# ============================================================
+# BEHAVIOUR ANALYSIS
+# ============================================================
 
 class BehaviourAnalysisView(APIView):
     permission_classes = [
@@ -728,29 +842,48 @@ class BehaviourAnalysisView(APIView):
             risk=risk,
         )
 
+        activity_type = str(
+            data.get(
+                "activity_type",
+                "OTHER",
+            )
+        ).upper()
+
+        valid_activity_types = {
+            "LOGIN",
+            "LOGOUT",
+            "ACCESS",
+            "NETWORK",
+            "DEVICE",
+            "OTHER",
+        }
+
+        if activity_type not in valid_activity_types:
+            activity_type = "OTHER"
+
         behaviour = UserBehaviour.objects.create(
             user=request.user,
-            unusual_access=analysis_input[
-                "unusual_access"
-            ],
-            unusual_resource_access=analysis_input[
-                "unusual_resource_access"
-            ],
-            unusual_request_volume=analysis_input[
-                "unusual_request_volume"
-            ],
-            new_device=analysis_input[
-                "new_device"
-            ],
-            new_location=analysis_input[
-                "new_location"
-            ],
-            suspicious_network=analysis_input[
-                "suspicious_network"
-            ],
-            risk_score=threat.risk_score,
-            severity=threat.severity,
-            analysis_result=result,
+            activity_type=activity_type,
+            ip_address=data.get(
+                "ip_address"
+            ),
+            user_agent=data.get(
+                "user_agent",
+                "",
+            ),
+            location=data.get(
+                "location",
+                "",
+            ),
+            device_id=data.get(
+                "device_id",
+                "",
+            ),
+            activity_data={
+                "request_data": dict(data),
+                "analysis_input": analysis_input,
+                "analysis_result": result,
+            },
         )
 
         anomaly = Anomaly.objects.create(
@@ -758,16 +891,13 @@ class BehaviourAnalysisView(APIView):
             anomaly_type="BEHAVIOUR",
             risk_score=threat.risk_score,
             severity=threat.severity,
-            description=threat.explanation,
-            detection_result=result,
+            explanation=threat.explanation,
         )
 
         AuditLog.objects.create(
             user=request.user,
             action="BEHAVIOUR_ANOMALY_ANALYZED",
-            ip_address=get_client_ip(
-                request
-            ),
+            ip_address=get_client_ip(request),
             user_agent=request.META.get(
                 "HTTP_USER_AGENT",
                 "",
@@ -824,6 +954,85 @@ class BehaviourAnalysisView(APIView):
         )
 
 
+# ============================================================
+# LOGIN ACTIVITY CREATE
+# ============================================================
+
+class LoginActivityCreateView(APIView):
+    permission_classes = [
+        IsAuthenticated
+    ]
+
+    @transaction.atomic
+    def post(
+        self,
+        request,
+    ):
+        data = request.data
+
+        status_value = str(
+            data.get(
+                "status",
+                "SUCCESS",
+            )
+        ).strip().upper()
+
+        if status_value not in {
+            "SUCCESS",
+            "FAILED",
+            "BLOCKED",
+        }:
+            return Response(
+                {
+                    "detail": (
+                        "status must be "
+                        "SUCCESS, FAILED, "
+                        "or BLOCKED."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        activity = LoginActivity.objects.create(
+            user=request.user,
+            ip_address=(
+                data.get("ip_address")
+                or get_client_ip(request)
+            ),
+            user_agent=(
+                data.get("user_agent")
+                or request.META.get(
+                    "HTTP_USER_AGENT",
+                    "",
+                )
+            ),
+            location=data.get(
+                "location",
+                "",
+            ),
+            device_id=data.get(
+                "device_id",
+                "",
+            ),
+            status=status_value,
+            failure_reason=data.get(
+                "failure_reason",
+                "",
+            ),
+        )
+
+        return Response(
+            LoginActivitySerializer(
+                activity
+            ).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+# ============================================================
+# LOGIN ACTIVITY HISTORY
+# ============================================================
+
 class LoginActivityHistoryView(
     generics.ListAPIView
 ):
@@ -833,12 +1042,20 @@ class LoginActivityHistoryView(
     ]
 
     def get_queryset(self):
-        return LoginActivity.objects.filter(
-            user=self.request.user
-        ).order_by(
-            "-created_at"
+        return (
+            LoginActivity.objects
+            .filter(
+                user=self.request.user
+            )
+            .order_by(
+                "-created_at"
+            )
         )
 
+
+# ============================================================
+# LOGIN ACTIVITY DETAIL
+# ============================================================
 
 class LoginActivityDetailView(
     generics.RetrieveAPIView
@@ -854,6 +1071,10 @@ class LoginActivityDetailView(
         )
 
 
+# ============================================================
+# BEHAVIOUR HISTORY
+# ============================================================
+
 class BehaviourHistoryView(
     generics.ListAPIView
 ):
@@ -863,12 +1084,20 @@ class BehaviourHistoryView(
     ]
 
     def get_queryset(self):
-        return UserBehaviour.objects.filter(
-            user=self.request.user
-        ).order_by(
-            "-created_at"
+        return (
+            UserBehaviour.objects
+            .filter(
+                user=self.request.user
+            )
+            .order_by(
+                "-created_at"
+            )
         )
 
+
+# ============================================================
+# BEHAVIOUR DETAIL
+# ============================================================
 
 class BehaviourDetailView(
     generics.RetrieveAPIView
@@ -884,6 +1113,10 @@ class BehaviourDetailView(
         )
 
 
+# ============================================================
+# ANOMALY HISTORY
+# ============================================================
+
 class AnomalyHistoryView(
     generics.ListAPIView
 ):
@@ -893,12 +1126,20 @@ class AnomalyHistoryView(
     ]
 
     def get_queryset(self):
-        return Anomaly.objects.filter(
-            user=self.request.user
-        ).order_by(
-            "-detected_at"
+        return (
+            Anomaly.objects
+            .filter(
+                user=self.request.user
+            )
+            .order_by(
+                "-detected_at"
+            )
         )
 
+
+# ============================================================
+# ANOMALY DETAIL
+# ============================================================
 
 class AnomalyDetailView(
     generics.RetrieveAPIView
