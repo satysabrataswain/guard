@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import re
@@ -201,8 +202,6 @@ class RegisterSerializer(
                 "Email address is required."
             )
 
-        # Model-level uniqueness is also enforced,
-        # but checking here gives a clean API error.
         if User.objects.filter(
             email__iexact=email
         ).exists():
@@ -284,11 +283,29 @@ class RegisterSerializer(
                 )
             )
 
+        # GUARD uses user_id as the public login identifier.
         if User.objects.filter(
             user_id=user_id
         ).exists():
             raise serializers.ValidationError(
                 "This User ID is already registered."
+            )
+
+        # AbstractUser also has a UNIQUE username field.
+        # GUARD keeps username synchronized with user_id.
+        #
+        # This check prevents:
+        #
+        # IntegrityError:
+        # UNIQUE constraint failed:
+        # accounts_user.username
+        #
+        # from reaching the database.
+        if User.objects.filter(
+            username=user_id
+        ).exists():
+            raise serializers.ValidationError(
+                "This User ID is already in use. Please choose another User ID."
             )
 
         return user_id
@@ -358,6 +375,10 @@ class RegisterSerializer(
 
         user_like_data = {
             "user_id": attrs.get(
+                "user_id",
+                "",
+            ),
+            "username": attrs.get(
                 "user_id",
                 "",
             ),
@@ -472,6 +493,20 @@ class RegisterSerializer(
             None,
         )
 
+        # --------------------------------------------------
+        # IMPORTANT:
+        # Django AbstractUser has a unique username field.
+        #
+        # GUARD's public login identifier is user_id.
+        # Therefore username is kept synchronized with user_id.
+        # --------------------------------------------------
+
+        user_id = validated_data.get(
+            "user_id"
+        )
+
+        validated_data["username"] = user_id
+
         user = User(
             **validated_data,
             role=User.ROLE_USER,
@@ -482,11 +517,7 @@ class RegisterSerializer(
             password
         )
 
-        user.save(
-            using=self.Meta.model._default_manager.db
-            if self.Meta.model._default_manager.db
-            else None
-        )
+        user.save()
 
         return user
 

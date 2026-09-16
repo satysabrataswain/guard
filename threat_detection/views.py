@@ -1072,8 +1072,7 @@ class ThreatAnalyzeView(
             )
         )
 
-        # Correlation is enabled only when at least
-        # two distinct threat sources are available.
+       
         if len(distinct_sources) >= 2:
 
             try:
@@ -1085,8 +1084,7 @@ class ThreatAnalyzeView(
                 )
 
             except Exception:
-                # Never break the original threat-analysis
-                # API merely because correlation fails.
+               
                 correlation_result = None
 
         # ------------------------------------------------------------------
@@ -1162,13 +1160,7 @@ class ThreatAnalyzeView(
         ):
             recommended_actions = []
 
-        # ------------------------------------------------------------------
-        # 6A. Apply unified correlation score
-        #
-        # We keep the original risk engine intact for compatibility.
-        # If correlation produces a valid unified score, it becomes the
-        # final multi-source risk score.
-        # ------------------------------------------------------------------
+        
 
         if isinstance(
             correlation_result,

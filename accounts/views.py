@@ -329,57 +329,62 @@ class LoginView(APIView):
             )
 
         # --------------------------------------------------
-        # CAPTCHA
+        # CAPTCHA - TEMPORARILY DISABLED FOR BACKEND TESTING
         # --------------------------------------------------
-
-        if _captcha_is_configured():
-            captcha_token = _get_captcha_token(
-                request
-            )
-
-            if not captcha_token:
-                _audit_login_failure(
-                    request,
-                    (
-                        "Login rejected because "
-                        "CAPTCHA verification was required "
-                        "but no CAPTCHA token was supplied."
-                    ),
-                )
-
-                return Response(
-                    {
-                        "detail": (
-                            "CAPTCHA verification "
-                            "is required."
-                        )
-                    },
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-
-            captcha_valid = verify_turnstile(
-                captcha_token,
-                ip_address,
-            )
-
-            if not captcha_valid:
-                _audit_login_failure(
-                    request,
-                    (
-                        "Turnstile CAPTCHA "
-                        "verification failed."
-                    ),
-                )
-
-                return Response(
-                    {
-                        "detail": (
-                            "CAPTCHA verification "
-                            "failed."
-                        )
-                    },
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
+        #
+        # CAPTCHA is intentionally commented out while the
+        # frontend is not connected yet.
+        #
+        # IMPORTANT:
+        # When the frontend is added, uncomment this complete
+        # block to re-enable Cloudflare Turnstile verification.
+        #
+        # if _captcha_is_configured():
+        #     captcha_token = _get_captcha_token(request)
+        #
+        #     if not captcha_token:
+        #         _audit_login_failure(
+        #             request,
+        #             (
+        #                 "Login rejected because "
+        #                 "CAPTCHA verification was required "
+        #                 "but no CAPTCHA token was supplied."
+        #             ),
+        #         )
+        #
+        #         return Response(
+        #             {
+        #                 "detail": (
+        #                     "CAPTCHA verification "
+        #                     "is required."
+        #                 )
+        #             },
+        #             status=status.HTTP_400_BAD_REQUEST,
+        #         )
+        #
+        #     captcha_valid = verify_turnstile(
+        #         captcha_token,
+        #         ip_address,
+        #     )
+        #
+        #     if not captcha_valid:
+        #         _audit_login_failure(
+        #             request,
+        #             (
+        #                 "Turnstile CAPTCHA "
+        #                 "verification failed."
+        #             ),
+        #         )
+        #
+        #         return Response(
+        #             {
+        #                 "detail": (
+        #                     "CAPTCHA verification "
+        #                     "failed."
+        #                 )
+        #             },
+        #             status=status.HTTP_400_BAD_REQUEST,
+        #         )
 
         # --------------------------------------------------
         # FIND USER

@@ -1,0 +1,195 @@
+1. AUTHENTICATION
+=================
+Base: /api/auth/
+
+POST  /api/auth/register/
+      New user registration
+
+POST  /api/auth/login/
+      User login + JWT token
+
+POST  /api/auth/token/refresh/
+      Refresh JWT access token
+
+GET   /api/auth/me/
+      Get current logged-in user
+
+POST  /api/auth/logout/
+      Logout
+
+
+2. THREAT DETECTION
+===================
+Base: /api/threats/
+
+GET/POST  /api/threats/
+          List threats / create threat
+
+POST      /api/threats/analyze/
+          Main threat analysis endpoint
+
+GET       /api/threats/<id>/
+          Get threat details
+
+DELETE    /api/threats/<id>/delete/
+          Delete threat
+
+
+3. PHISHING
+===========
+Base: /api/phishing/
+
+POST  /api/phishing/url/analyze/
+      Analyze URL for phishing/malicious indicators.
+      Includes URL shortener and redirect-chain inspection.
+
+POST  /api/phishing/email/analyze/
+      Analyze phishing email.
+
+GET/POST  /api/phishing/history/
+          Get/create phishing scan history
+
+GET  /api/phishing/<id>/
+     Get phishing scan details
+
+DELETE  /api/phishing/<id>/delete/
+        Delete phishing scan
+
+
+4. IMPERSONATION / DEEPFAKE
+===========================
+Base: /api/impersonation/
+
+POST  /api/impersonation/image/analyze/
+      Analyze image for impersonation/deepfake indicators
+
+POST  /api/impersonation/video/analyze/
+      Analyze video for deepfake indicators
+
+GET  /api/impersonation/history/
+     Get impersonation analysis history
+
+GET  /api/impersonation/<id>/
+     Get analysis details
+
+DELETE  /api/impersonation/<id>/delete/
+        Delete analysis
+
+
+5. ANOMALY DETECTION
+====================
+Base: /api/anomaly/
+
+POST  /api/anomaly/login/analyze/
+      Analyze login for anomalous activity
+
+POST  /api/anomaly/behavior/
+      Analyze user/system behavior
+
+POST  /api/anomaly/login/activity/
+      Record login activity
+
+GET  /api/anomaly/history/
+     Get anomaly history
+
+GET  /api/anomaly/behavior/history/
+     Get behavior anomaly history
+
+GET  /api/anomaly/behavior/<id>/
+     Get behavior anomaly details
+
+GET  /api/anomaly/login/history/
+     Get login anomaly history
+
+GET  /api/anomaly/login/activity/<id>/
+     Get login activity details
+
+GET  /api/anomaly/<id>/
+     Get anomaly details
+
+
+6. INCIDENTS & RESPONSE
+=======================
+Base: /api/incidents/
+
+GET/POST  /api/incidents/
+          List incidents / create incident
+
+GET       /api/incidents/<id>/
+          Get incident details
+
+DELETE    /api/incidents/<id>/delete/
+          Delete incident
+
+GET/POST  /api/incidents/<id>/evidence/
+          Get/add incident evidence
+
+GET/POST  /api/incidents/<id>/response/
+          Get/add response action
+
+POST      /api/incidents/response/<id>/execute/
+          Execute response action
+
+POST      /api/incidents/<id>/resolve/
+          Resolve incident
+
+
+7. AUDIT LOGS
+=============
+Base: /api/audit/
+
+GET  /api/audit/
+     Get audit logs
+
+GET  /api/audit/admin/
+     Get admin audit logs
+
+GET  /api/audit/my/
+     Get current user's audit logs
+
+GET  /api/audit/<id>/
+     Get audit log details
+
+
+GUARD HIGH-LEVEL FLOW
+=====================
+
+Frontend
+   |
+   v
+AUTHENTICATION
+Register / Login / JWT
+   |
+   +-------------------+-------------------+
+   |                   |                   |
+   v                   v                   v
+PHISHING          IMPERSONATION        ANOMALY
+URL / Email       Image / Video        Login / Behavior
+   |                   |                   |
+   +-------------------+-------------------+
+                       |
+                       v
+              THREAT DETECTION
+              Correlation Engine
+              Unified Risk Score
+                       |
+                       v
+                  INCIDENTS
+              Evidence / Response
+              Execute / Resolve
+                       |
+                       v
+                  AUDIT LOGS
+
+
+ENDPOINT COUNT
+==============
+Authentication:       5
+Threat Detection:     4
+Phishing:             5
+Impersonation:        5
+Anomaly Detection:    9
+Incidents & Response: 7
+Audit Logs:           4
+--------------------------------
+TOTAL:               39
