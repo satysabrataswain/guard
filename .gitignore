@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+
+# Environment / secrets
+.env
+*.pem
+*.key
+
+# Local databases
+*.sqlite3
+
+# ML datasets - never commit large datasets
+datasets/*
+!datasets/**/.gitkeep
+
+# Trained models / checkpoints
+trained_models/
+training_results/
+*.pt
+*.pth
+*.onnx
+*.h5
+*.joblib
+*.pkl
+*.bin
+*.safetensors
+
+# Temporary media
+media/
+tmp/
+temp/
+
+# Logs
+*.log
